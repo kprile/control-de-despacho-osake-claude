@@ -99,7 +99,7 @@ Columnas de `orders` agregadas después del esquema inicial: `trip_id TEXT`, `de
 
 ```json
 {
-  "id": "m-12",                       // id interno legible
+  "id": "P-1001",                     // id interno legible (P-<n>)
   "source": "manual" | "mercat",
   "externalId": "mercat:STORE:ID" | null,
   "channel": "meson" | "telefono" | "mercat" | "otro",
@@ -113,6 +113,7 @@ Columnas de `orders` agregadas después del esquema inicial: `trip_id TEXT`, `de
   "promisedAt": "ISO" | null,
   "status": "preparing",
   "externalStatus": "preparing" | null,
+  "pickup": false,                    // retiro en local (no se despacha)
   "driverId": 3 | null, "driverName": "Jorge" | null,
   "createdAt": "ISO", "readyAt": null, "departedAt": null, "deliveredAt": null,
   "deliveryLat": null, "deliveryLng": null, "deliveryAccuracy": null,
@@ -137,7 +138,7 @@ Los motoristas no reciben `total` ni datos de otros pedidos.
 | `GET /api/state` | sesión | query opcional `from`, `to` (YYYY-MM-DD, hora Chile), `branch`, `driverId` para métricas | ver abajo |
 | `POST /api/users` | admin | `{ name, username, password, role }` | `{ user }` |
 | `POST /api/users/update` | admin | `{ id, active?, password? }` | `{ user }` (desactivar usuario cierra sus sesiones) |
-| `POST /api/orders` | admin, local | campos de Order editables: `channel, branch, customerName, customerPhone, address, addressDetail, notes, deliveryFee, total, promisedAt, items` (address obligatorio) | `{ order }` |
+| `POST /api/orders` | admin, local | campos de Order editables: `channel, branch, customerName, customerPhone, address, addressDetail, notes, lat, lng, deliveryFee, total, promisedAt, items` (address obligatorio; `lat`/`lng` opcionales, destino para la verificación de ubicación) | `{ order }` |
 | `POST /api/action` | según tabla | `{ orderId, action, driverId?, note?, lat?, lng?, accuracy? }`; para `depart_batch`: `{ action, orderIds }` | `{ order }`; `depart_batch`: `{ tripId, orders }` |
 | `POST /api/settings` | admin | `{ month: "YYYY-MM", labor, fuel, maintenance, insurance, other }` (CLP enteros >= 0) | `{ costs }` |
 | `GET /api/qr?id=<orderId>` | sesión con acceso al pedido | — | `image/svg+xml` etiqueta con QR + id + dirección |
@@ -203,8 +204,8 @@ Decisión del usuario: **SQLite es la fuente de verdad**. Google Sheets es solo 
 - Autenticación con cuenta de servicio sin dependencias: JWT RS256 firmado con `node:crypto` (scope `https://www.googleapis.com/auth/spreadsheets`), canjeado en `https://oauth2.googleapis.com/token`; el token se reutiliza hasta 1 min antes de vencer. Nunca se registran la clave ni el token.
 - Cada cambio de pedido (todo lo que escribe en `order_events`: acciones, pedidos manuales, webhook) y cada `POST /api/settings` marca la copia como pendiente. Un temporizador en segundo plano (`unref`) reescribe la hoja cuando hay cambios pendientes y pasó `GOOGLE_SHEETS_INTERVAL_SECONDS`. Una sola copia a la vez; ante error, reintento con espera creciente (hasta 30 min) y timeout de red de 15 s por llamada. Nunca bloquea ni hace fallar una petición de usuario ni el webhook.
 - Reescritura completa e idempotente: `spreadsheets.get` (crea con `batchUpdate addSheet` las pestañas que falten), `values:batchClear` y `values:batchUpdate` con `valueInputOption: RAW`.
-- Pestaña `Pedidos`: encabezado + un pedido por fila, creados en los últimos `GOOGLE_SHEETS_DAYS` días (hora Chile), **sin retiros (pickup)**. Columnas: id, origen, canal, sucursal, cliente, dirección, motorista, estado, estado externo, tarifa (CLP), monto pedido (CLP), creado, listo, salida, entregado (`YYYY-MM-DD HH:mm` hora Chile), min hasta listo, min espera retiro, min reparto, min total, incidencias y, si existen en la base, las columnas de distancia de entrega (`orders.*distan*`). No incluye el teléfono del cliente.
-- Pestaña `Resumen`: métricas de los últimos 7 y 30 días (mismo cálculo que `Metrics`, con cantidad de pedidos que sustentan cada promedio) y costos del mes actual (`Costs`).
+- Pestaña `Pedidos`: encabezado + un pedido por fila, creados en los últimos `GOOGLE_SHEETS_DAYS` días (hora Chile), **sin retiros (pickup)**. Columnas: id, origen, canal, sucursal, cliente, dirección, motorista, estado, estado externo, tarifa (CLP), monto pedido (CLP), creado, listo, salida, entregado (`YYYY-MM-DD HH:mm` hora Chile), min hasta listo, min espera retiro, min reparto, min total, incidencias, vuelta (`trip_id`), distancia de entrega (m) (`delivery_distance_m`), verificación de ubicación (`delivery_check`: OK / Lejos del destino / Sin ubicación / Sin destino) y ráfaga (`sí`/`no` solo en entregados). No incluye el teléfono del cliente.
+- Pestaña `Resumen`: métricas de los últimos 7 y 30 días (mismo cálculo que `Metrics`, con cantidad de pedidos que sustentan cada promedio y `locationFlaggedCount`) y costos del mes actual (`Costs`).
 - Todo texto que empiece con `=`, `+`, `-` o `@` se antepone con `'`.
 
 `SheetsStatus` (en `GET /api/state` solo admin, y respuesta de `POST /api/sheets/sync`):

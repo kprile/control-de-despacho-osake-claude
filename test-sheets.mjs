@@ -229,15 +229,53 @@ test('copia completa: JWT firmado, pestañas creadas, encabezado y filas, pickup
   assert.equal((await admin.get('/api/state')).data.sheets.pendingChanges, true);
 });
 
-test('columnas de distancia se agregan si existen en la base', async () => {
-  const cols = app.db.prepare('PRAGMA table_info(orders)').all().map((c) => c.name);
-  if (!cols.includes('delivery_distance_m')) app.db.exec('ALTER TABLE orders ADD COLUMN delivery_distance_m REAL');
-  app.db.exec("UPDATE orders SET delivery_distance_m = 42 WHERE address = 'Ortúzar 123'");
+test('salida en lote y entrega con ubicación marcan pendiente y llenan vuelta, distancia, verificación y ráfaga', async () => {
+  const dest = { lat: -33.685, lng: -71.215 };
+  const ids = [];
+  for (const address of ['Lote A 1', 'Lote B 2']) {
+    const id = (await local.post('/api/orders', { address, ...dest })).data.order.id;
+    await local.post('/api/action', { orderId: id, action: 'ready' });
+    await local.post('/api/action', { orderId: id, action: 'assign', driverId });
+    ids.push(id);
+  }
   await admin.post('/api/sheets/sync');
+  assert.equal((await admin.get('/api/state')).data.sheets.pendingChanges, false);
+
+  const batch = await moto.post('/api/action', { action: 'depart_batch', orderIds: ids });
+  assert.equal(batch.status, 200);
+  assert.equal((await admin.get('/api/state')).data.sheets.pendingChanges, true, 'depart_batch marca pendiente');
+  await admin.post('/api/sheets/sync');
+
+  // ~1,1 km al norte del destino: far (y ráfaga con la siguiente entrega inmediata).
+  const far = await moto.post('/api/action', { orderId: ids[0], action: 'deliver', lat: dest.lat + 0.01, lng: dest.lng, accuracy: 10 });
+  assert.equal(far.data.order.deliveryCheck, 'far');
+  assert.equal((await admin.get('/api/state')).data.sheets.pendingChanges, true, 'entrega con verificación marca pendiente');
+  assert.equal((await moto.post('/api/action', { orderId: ids[1], action: 'deliver' })).status, 200);
+  await admin.post('/api/sheets/sync');
+
   const [header, ...rows] = fake.values.Pedidos;
-  const i = header.findIndex((h) => /distance/.test(h));
-  assert.ok(i > 0, 'hay columna de distancia');
-  assert.ok(rows.some((r) => r[i] === 42));
+  assert.deepEqual(header.slice(20), ['vuelta', 'distancia de entrega (m)', 'verificación de ubicación', 'ráfaga']);
+  const col = (name) => header.indexOf(name);
+  const byAddr = (a) => rows.find((x) => String(x[col('dirección')]).startsWith(a));
+  const a = byAddr('Lote A 1');
+  const b = byAddr('Lote B 2');
+  assert.equal(a[col('vuelta')], batch.data.tripId);
+  assert.equal(b[col('vuelta')], batch.data.tripId);
+  assert.equal(a[col('distancia de entrega (m)')], far.data.order.deliveryDistanceM);
+  assert.ok(a[col('distancia de entrega (m)')] > 1000);
+  assert.equal(a[col('verificación de ubicación')], 'Lejos del destino');
+  assert.equal(b[col('distancia de entrega (m)')], '');
+  assert.equal(b[col('verificación de ubicación')], 'Sin ubicación');
+  assert.equal(a[col('ráfaga')], 'sí');
+  assert.equal(b[col('ráfaga')], 'sí');
+  // Pedido no entregado: sin vuelta, verificación ni ráfaga.
+  const open = byAddr('Serrano 45');
+  assert.deepEqual(open.slice(20), ['', '', '', '']);
+  // Salida individual: sin vuelta; entregado sin GPS.
+  assert.equal(byAddr('Ortúzar 123')[col('vuelta')], '');
+  assert.equal(byAddr('Ortúzar 123')[col('verificación de ubicación')], 'Sin ubicación');
+  const flagged = fake.values.Resumen.find((x) => x[0] === 'Entregas con observación de ubicación');
+  assert.ok(flagged && flagged[1] >= 2);
 });
 
 test('error de la API queda en lastError sin romper el servidor', async () => {

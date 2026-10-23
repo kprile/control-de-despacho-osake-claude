@@ -618,6 +618,51 @@ test('salida en lote: todo o nada (no listo, ajeno, motoristas distintos, límit
   assert.equal((await w.c.ma.post('/api/action', { action: 'depart_batch', orderIds: [okA, okB] })).status, 200);
 });
 
+test('salida en lote: retiro, repetido con otra escritura, ya en ruta y motorista sin permiso sobre ajeno', async () => {
+  const w = await world();
+  const okA = await w.readyOrder('ma');
+  // Pedido Mercat asignado y luego cambiado a retiro por el webhook: queda pickup con motorista.
+  const ts = Date.now();
+  const cr = await webhook(w.base, { event_id: 'lote-p1', event_type: 'orders.create', event_timestamp: ts,
+    event_data: { id: 'LP1', store_id: 'S', status: 'ready', user_address: 'Mercat 1', delivery_type: 'delivery' } });
+  const pick = cr.data.orderId;
+  assert.equal((await w.c.caja.post('/api/action', { orderId: pick, action: 'assign', driverId: w.ids.ma })).status, 200);
+  await webhook(w.base, { event_id: 'lote-p2', event_type: 'orders.update', event_timestamp: ts + 1000,
+    event_data: { id: 'LP1', store_id: 'S', delivery_type: 'pickup' } });
+  assert.equal(w.order(pick).pickup, 1);
+  assert.equal(w.order(pick).driver_id, w.ids.ma);
+  for (const c of [w.c.ma, w.c.caja, w.c.admin]) {
+    const r = await c.post('/api/action', { action: 'depart_batch', orderIds: [okA, pick] });
+    assert.equal(r.status, 409);
+    assert.equal(r.data.orderId, pick);
+  }
+  assert.equal(w.order(okA).status, 'ready');
+  // El mismo pedido con y sin prefijo, o en minúsculas, cuenta como repetido.
+  for (const dup of [`DESPACHO:${okA}`, okA.toLowerCase()]) {
+    assert.equal((await w.c.ma.post('/api/action', { action: 'depart_batch', orderIds: [okA, dup] })).status, 400);
+  }
+  // Elementos que no son texto: 400 sin tocar nada.
+  assert.equal((await w.c.ma.post('/api/action', { action: 'depart_batch', orderIds: [okA, { id: okA }] })).status, 400);
+  assert.equal(w.order(okA).status, 'ready');
+  // Un motorista no puede sacar en lote un pedido ajeno aunque la otra parte sea suya, ni aparece su estado.
+  const other = await w.readyOrder('mb');
+  const fr = await w.c.ma.post('/api/action', { action: 'depart_batch', orderIds: [other] });
+  assert.equal(fr.status, 404);
+  assert.ok(!fr.data.message.includes('ready'));
+  assert.equal(w.order(other).status, 'ready');
+  // Ya en ruta: un segundo lote con el mismo pedido no cambia trip_id ni departed_at.
+  const ok = await w.c.ma.post('/api/action', { action: 'depart_batch', orderIds: [okA] });
+  assert.equal(ok.status, 200);
+  const snap = w.order(okA);
+  const okC = await w.readyOrder('ma');
+  const again = await w.c.ma.post('/api/action', { action: 'depart_batch', orderIds: [okC, okA] });
+  assert.equal(again.status, 409);
+  assert.equal(again.data.orderId, okA);
+  assert.equal(w.order(okA).trip_id, snap.trip_id);
+  assert.equal(w.order(okA).departed_at, snap.departed_at);
+  assert.equal(w.order(okC).status, 'ready');
+});
+
 // Destino conocido en Melipilla; 0,001° de latitud ≈ 111 m.
 const DEST = { lat: -33.6850, lng: -71.2150 };
 

@@ -37,19 +37,18 @@ const STATUS_LABEL = {
   preparing: 'En preparación', ready: 'Listo', in_transit: 'En ruta',
   delivered: 'Entregado', canceled: 'Cancelado', failed: 'No entregado',
 };
-const round1 = (n) => (n === null || n === undefined || !Number.isFinite(n) ? null : Math.round(n * 10) / 10);
-const distanceLabel = (col) => {
-  const base = col.replace(/^delivery_/, '').replace(/_/g, ' ');
-  return /_m$/.test(col) ? `${base.replace(/ m$/, '')} (m)` : base;
+const CHECK_LABEL = {
+  ok: 'OK', far: 'Lejos del destino', no_location: 'Sin ubicación', no_destination: 'Sin destino',
 };
+const round1 = (n) => (n === null || n === undefined || !Number.isFinite(n) ? null : Math.round(n * 10) / 10);
 
 // snapshot: { generatedAt, orders: [fila de orders + driver_name + minutes{prep,wait,route,total} + incidents[]],
-//   distanceColumns: [nombres de columna], metrics7, metrics30, costs }
+//   metrics7, metrics30, costs }
 export function buildOrdersTable(snapshot) {
-  const dist = snapshot.distanceColumns || [];
   const header = ['id', 'origen', 'canal', 'sucursal', 'cliente', 'dirección', 'motorista', 'estado', 'estado externo',
     'tarifa (CLP)', 'monto pedido (CLP)', 'creado', 'listo', 'salida', 'entregado',
-    'min hasta listo', 'min espera retiro', 'min reparto', 'min total', 'incidencias', ...dist.map(distanceLabel)];
+    'min hasta listo', 'min espera retiro', 'min reparto', 'min total', 'incidencias',
+    'vuelta', 'distancia de entrega (m)', 'verificación de ubicación', 'ráfaga'];
   const rows = [header];
   for (const o of snapshot.orders) {
     const m = o.minutes || {};
@@ -61,7 +60,9 @@ export function buildOrdersTable(snapshot) {
       chileDateTime(o.created_at), chileDateTime(o.ready_at), chileDateTime(o.departed_at), chileDateTime(o.delivered_at),
       round1(m.prep), round1(m.wait), round1(m.route), round1(m.total),
       (o.incidents || []).map((i) => `${chileDateTime(i.at)} ${i.by}: ${i.note}`).join(' | '),
-      ...dist.map((c) => o[c]),
+      o.trip_id ?? '', o.delivery_distance_m ?? null,
+      o.delivery_check ? (CHECK_LABEL[o.delivery_check] || o.delivery_check) : '',
+      o.status === 'delivered' ? !!o.delivery_burst : '',
     ].map(cell));
   }
   return rows;
@@ -91,6 +92,7 @@ export function buildSummaryTable(snapshot) {
     ['Entregados', a.deliveredCount, b.deliveredCount],
     ['No entregados', a.failedCount, b.failedCount],
     ['Cancelados', a.canceledCount, b.canceledCount],
+    ['Entregas con observación de ubicación', a.locationFlaggedCount, b.locationFlaggedCount],
     [],
     ['Costos del mes', c.month],
     ['Personal', c.labor],

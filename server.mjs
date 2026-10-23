@@ -1106,11 +1106,9 @@ export function createApp({ dbPath, env = process.env, publicDir = path.join(ROO
     for (let i = 0; i < rows.length; i += 500) {
       for (const [k, v] of incidentsFor(rows.slice(i, i + 500).map((r) => r.id))) inc.set(k, v);
     }
-    const distanceColumns = db.prepare('PRAGMA table_info(orders)').all().map((c) => c.name).filter((n) => /distan/i.test(n));
     return {
       generatedAt: nowIso(),
       orders: rows.map((o) => ({ ...o, minutes: intervals(o), incidents: inc.get(o.id) || [] })),
-      distanceColumns,
       metrics7: computeMetrics({ from: addDays(to, -6), to, ...all }),
       metrics30: computeMetrics({ from: addDays(to, -29), to, ...all }),
       costs: computeCosts(to.slice(0, 7)),
