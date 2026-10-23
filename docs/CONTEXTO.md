@@ -82,7 +82,16 @@ Hasta tener respuesta, el formulario manual del local cubre mesón/teléfono. No
 
 **C. Integraciones:** autorización del comercio, credenciales y URL del webhook, delivery vs retiro, significado real de estados, eventos con igual timestamp, recuperación de pedidos omitidos, correlación Mercat–Restô, claves solo en el servidor.
 
-**D. Piloto operativo:** quién marca listo, asigna y confirma retiro; qué es entrega e incidencia; categorías de costo; 2–4 semanas de datos reales (recomendación, no plazo acordado). Después: salida en lote, validación de cercanía al destino, kilómetros, rutas, Sheets, notificaciones.
+**D. Piloto operativo:** quién marca listo, asigna y confirma retiro; qué es entrega e incidencia; categorías de costo; 2–4 semanas de datos reales (recomendación, no plazo acordado). Después: kilómetros, rutas, Sheets, notificaciones.
+
+**E. Salida en lote y aviso de distancia (implementado, falta probar en terreno):**
+
+| Función | Estado | Pendiente |
+|---|---|---|
+| Salida en lote ("Salí con N pedidos", vuelta `tripId`) | Hecho en backend y web del motorista; escaneo QR puede sumar a la salida. | Probar con Jorge en una vuelta real; el local aún registra salidas de a una. |
+| Aviso de distancia al entregar (umbral `DELIVERY_WARN_METERS`, 300 m) | Hecho: avisa y registra, no bloquea. Indicador en pedidos cerrados, métricas y CSV. | Calibrar el umbral con datos reales (GPS en interiores, edificios). |
+| Detección de entregas en ráfaga (< 60 s, lejos entre sí) | Hecho (campo `deliveryBurst`). | Revisar falsos positivos con datos reales. |
+| Destino de pedidos manuales | Sin coordenadas => `no_destination` (no verificable). | Geocodificación de direcciones: **no contratada**, no implementada. Depende también de que Mercat envíe `latitude`/`longitude`. |
 
 ## Criterios para considerar operativo el piloto
 

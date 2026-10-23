@@ -26,6 +26,7 @@ Documento fuente de verdad entre backend, web y Android. Si algo cambia, se camb
 | `GOOGLE_SHEETS_INTERVAL_SECONDS` | `60` | Segundos mínimos entre copias. |
 | `GOOGLE_SHEETS_DAYS` | `90` | Días de pedidos copiados. |
 | `GOOGLE_API_BASE`, `GOOGLE_TOKEN_URL` | Google | Solo para pruebas (servidor falso). |
+| `DELIVERY_WARN_METERS` | `300` | Umbral (m) de la verificación de ubicación al entregar. Valor inválido o <= 0 => 300. |
 
 El servidor carga `.env` si existe (parser propio mínimo `CLAVE=valor`).
 
@@ -43,14 +44,46 @@ Estados locales: `preparing`, `ready`, `in_transit`, `delivered`, `canceled`, `f
 |---|---|---|---|
 | `ready` | admin, local | `preparing` | `ready`, fija `ready_at` |
 | `assign` (`driverId`) | admin, local | `preparing`, `ready` | fija `driver_id` (reasignable mientras no haya salido) |
-| `depart` | driver asignado, admin, local | `ready` con motorista | `in_transit`, fija `departed_at` |
-| `deliver` (`lat`,`lng`,`accuracy` opcionales) | driver asignado, admin | `in_transit` | `delivered`, fija `delivered_at` y ubicación |
+| `depart` | driver asignado, admin, local | `ready` con motorista | `in_transit`, fija `departed_at` (`trip_id` queda null) |
+| `depart_batch` (`orderIds`, 1–20) | driver (solo sus pedidos), admin, local | todos `ready` con el **mismo** motorista | todos `in_transit` con la misma `departed_at` y un `trip_id` común |
+| `deliver` (`lat`,`lng`,`accuracy` opcionales) | driver asignado, admin | `in_transit` | `delivered`, fija `delivered_at`, ubicación y verificación de ubicación (ver abajo) |
 | `incident` (`note` obligatorio) | driver asignado, admin, local | `ready`, `in_transit` | agrega nota de incidencia, no cambia estado |
 | `fail` (`note` obligatorio) | driver asignado, admin | `in_transit` | `failed` |
 | `cancel` (`note` opcional) | admin, local | `preparing`, `ready` | `canceled` |
 
 Errores de transición: HTTP 409 `{ "error": "invalid_transition", "message": "..." }`. Repetir entrega => 409.
 Cada acción queda en tabla `order_events` (historial; nunca se borra).
+
+### Salida en lote (`depart_batch`)
+
+- Request: `POST /api/action` con `{ "action": "depart_batch", "orderIds": ["P-1001", "DESPACHO:P-1002", ...] }`. Respuesta 200: `{ "tripId": "V-...", "orders": [Order] }` en el mismo orden pedido.
+- `orderIds` no es lista, está vacía, trae más de 20 o repite un id => 400 `bad_request`.
+- **Todo o nada** (una transacción): si un pedido no es válido no cambia ninguno. Error con el campo extra `orderId` del pedido que falló y su id en `message`:
+  - inexistente, o (motorista) asignado a otro => 404 `not_found` (igual que hoy: los ajenos "no existen");
+  - no está `ready`, es retiro, no tiene motorista o tiene otro motorista que el resto => 409 `invalid_transition`.
+- Todos reciben la misma `departed_at` y el mismo `trip_id` (`V-<base36 tiempo>-<6 hex>`). Se registra un evento `depart` por pedido en `order_events` con esa misma hora y `data_json = { tripId, batchSize }`.
+- La entrega sigue siendo por pedido (`deliver`), cada uno con su propia hora. No existe "entregar todos".
+
+### Verificación de ubicación al entregar (avisa y registra, **nunca bloquea**)
+
+Al `deliver` se calcula `delivery_check`:
+
+| Valor | Cuándo |
+|---|---|
+| `no_location` | No llegó `lat`/`lng` (GPS negado, apagado o sin señal). Tiene prioridad sobre `no_destination`. |
+| `no_destination` | El pedido no tiene `lat`/`lng` de destino (p. ej. pedidos manuales: **no hay geocodificación**, pendiente). |
+| `far` | Distancia haversine > `DELIVERY_WARN_METERS`, **o** `accuracy` reportada > `DELIVERY_WARN_METERS`. |
+| `ok` | Dentro del umbral y con precisión aceptable. |
+
+`delivery_distance_m` (entero, metros) se guarda cuando hay ambos puntos (`ok`/`far`), si no queda null.
+
+**Ráfaga** (campo booleano aparte `delivery_burst`, para no perder `ok`/`far`): solo cuando marca un motorista. Si su entrega anterior (pedido con `driver_id` = él, `delivered_at` < 60 s antes) existe y (ambas ubicaciones de entrega están a más del umbral entre sí, o alguna de las dos es `far`), se marcan **ambas** entregas con `delivery_burst = 1`. El evento `deliver` guarda `{ lat, lng, accuracy, distanceM, check, burstWith? }`; la entrega anterior recibe un evento `burst_flag`.
+
+La web del motorista muestra un aviso no bloqueante si la respuesta trae `deliveryCheck = "far"`. El local/admin ve la observación en pedidos cerrados y el contador en métricas.
+
+### Esquema y migración
+
+Columnas de `orders` agregadas después del esquema inicial: `trip_id TEXT`, `delivery_distance_m INTEGER`, `delivery_check TEXT`, `delivery_burst INTEGER NOT NULL DEFAULT 0` (+ índice `orders_trip`). Al abrir la base el servidor revisa `PRAGMA table_info(orders)` y agrega con `ALTER TABLE ... ADD COLUMN` las que falten; los datos existentes se conservan (entregas antiguas quedan con verificación null y no cuentan en el indicador).
 
 ## Formato general
 
@@ -83,6 +116,10 @@ Cada acción queda en tabla `order_events` (historial; nunca se borra).
   "driverId": 3 | null, "driverName": "Jorge" | null,
   "createdAt": "ISO", "readyAt": null, "departedAt": null, "deliveredAt": null,
   "deliveryLat": null, "deliveryLng": null, "deliveryAccuracy": null,
+  "tripId": "V-MVKD...-61EF0F" | null,   // vuelta compartida si salió en lote
+  "deliveryDistanceM": 856 | null,       // metros entre ubicación de entrega y destino
+  "deliveryCheck": "ok" | "far" | "no_location" | "no_destination" | null,  // null: no entregado o anterior a la función
+  "deliveryBurst": false,                // entrega en ráfaga
   "incidents": [{ "at": "ISO", "by": "Jorge", "note": "..." }]
 }
 ```
@@ -101,10 +138,10 @@ Los motoristas no reciben `total` ni datos de otros pedidos.
 | `POST /api/users` | admin | `{ name, username, password, role }` | `{ user }` |
 | `POST /api/users/update` | admin | `{ id, active?, password? }` | `{ user }` (desactivar usuario cierra sus sesiones) |
 | `POST /api/orders` | admin, local | campos de Order editables: `channel, branch, customerName, customerPhone, address, addressDetail, notes, deliveryFee, total, promisedAt, items` (address obligatorio) | `{ order }` |
-| `POST /api/action` | según tabla | `{ orderId, action, driverId?, note?, lat?, lng?, accuracy? }` | `{ order }` |
+| `POST /api/action` | según tabla | `{ orderId, action, driverId?, note?, lat?, lng?, accuracy? }`; para `depart_batch`: `{ action, orderIds }` | `{ order }`; `depart_batch`: `{ tripId, orders }` |
 | `POST /api/settings` | admin | `{ month: "YYYY-MM", labor, fuel, maintenance, insurance, other }` (CLP enteros >= 0) | `{ costs }` |
 | `GET /api/qr?id=<orderId>` | sesión con acceso al pedido | — | `image/svg+xml` etiqueta con QR + id + dirección |
-| `GET /api/export.csv` | admin | mismos filtros que métricas | CSV con un pedido por fila y los 4 tiempos |
+| `GET /api/export.csv` | admin | mismos filtros que métricas | CSV con un pedido por fila y los 4 tiempos; al final columnas `vuelta`, `distancia_entrega_m`, `verificacion_ubicacion`, `rafaga` (`si`/`no` en entregados) |
 | `POST /api/webhooks/mercat` | encabezado `X-Webhook-Secret` | evento Mercat | `200 { ok: true, applied: bool, duplicate: bool }` |
 | `POST /api/sheets/sync` | admin | — | `{ sheets: SheetsStatus }`; 503 `not_configured` si la copia está deshabilitada |
 
@@ -114,6 +151,7 @@ Los motoristas no reciben `total` ni datos de otros pedidos.
 {
   "user": { "id": 1, "name": "...", "username": "...", "role": "admin" },
   "serverTime": "ISO",
+  "deliveryWarnMeters": 300,  // umbral vigente, para los textos de aviso
   "orders": [Order],          // activos + entregados/cerrados de las últimas 24 h; driver: solo los suyos
   "drivers": [{ "id": 3, "name": "Jorge", "active": true }],   // admin/local
   "users": [User],            // solo admin
@@ -134,6 +172,8 @@ Los motoristas no reciben `total` ni datos de otros pedidos.
   "route":  { "avgMinutes": 21.4, "count": 37 },   // delivered - departed
   "total":  { "avgMinutes": 45.0, "count": 37 },   // delivered - created
   "deliveredCount": 37, "failedCount": 1, "canceledCount": 2,
+  "locationFlaggedCount": 3,   // entregados con far, no_location o ráfaga (cada pedido cuenta una vez)
+  "locationChecks": { "ok": 30, "far": 2, "noLocation": 1, "noDestination": 4, "burst": 1 },
   "byDriver": [{ "driverId": 3, "name": "Jorge", "deliveries": 20, "routeAvgMinutes": 19.0 }],
   "byChannel": [{ "channel": "mercat", "orders": 30, "totalAvgMinutes": 44.0 }]
 }
@@ -196,7 +236,9 @@ Cuerpo: `{ event_id, event_type, event_timestamp, api_version, client_id, event_
 - Una sola página (`index.html`, `app.js`, `style.css`), sin frameworks ni CDN, en español de Chile, apta para teléfono (WebView) y escritorio.
 - Pantallas según estado: alta inicial, login, panel.
 - Panel admin/local: crear pedido manual, lista por estado, asignar motorista, marcar listo, cancelar, imprimir QR, lector de código (campo de texto + evento Android), métricas con filtros fecha/sucursal, costos del mes (admin), usuarios (admin), exportar CSV (admin).
-- Panel motorista: tarjetas grandes de sus pedidos con botón **Salí** (con confirmación), **Entregado** (con confirmación, pide GPS opcional vía `navigator.geolocation`), **Incidencia**, enlace “Abrir en mapa” (`https://www.google.com/maps/search/?api=1&query=...`), llamar al cliente (`tel:`).
+- Panel motorista: tarjetas grandes de sus pedidos agrupadas en En ruta / Listos para retirar / En preparación, con botón **Salí** (con confirmación), **Entregado** (con confirmación, pide GPS opcional vía `navigator.geolocation`; si la respuesta es `far` muestra un aviso no bloqueante con la distancia), **Incidencia**, enlace “Abrir en mapa” (`https://www.google.com/maps/search/?api=1&query=...`), llamar al cliente (`tel:`).
+- Salida en lote (motorista): en "Listos para retirar" cada tarjeta tiene una casilla; una barra fija muestra **Salí con N pedidos** (diálogo que lista ids y direcciones antes de confirmar). La selección vive en memoria de la página, sobrevive al refresco de 15 s y se poda a los pedidos que siguen listos. Al escanear un pedido listo el diálogo ofrece "Salir solo con este" o "Agregar a la salida". El panel del local no tiene salida en lote (usa "Registrar salida" por pedido).
+- Panel local/admin: pedidos cerrados muestran la verificación de ubicación (distancia, sin ubicación, sin destino, ráfaga) y la insignia "Revisar ubicación"; métricas con el contador "Entregas con observación de ubicación".
 - Refresco cada 15 s con `GET /api/state`, sin refrescar si hay un input con foco con contenido o un `<dialog>` abierto.
 - Integración Android: escuchar `window.addEventListener('android-scan', e => e.detail.text)`. El texto escaneado es el contenido del QR. Formato del QR: `DESPACHO:<orderId>`. Al recibirlo: buscar el pedido, mostrarlo y pedir confirmación de la acción siguiente válida (no ejecutar sin confirmar).
 - Si `window.AndroidApp` existe (solo métodos `scan()` y `openSettings()`), mostrar botón “Escanear QR” que llama `AndroidApp.scan()`.

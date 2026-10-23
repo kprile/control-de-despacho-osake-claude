@@ -509,3 +509,258 @@ test('hora Chile sin zona en el salto a horario de verano (septiembre)', async (
   assert.deepEqual(await day('2026-09-06'), { avgMinutes: 50, count: 1 });
   assert.equal((await day('2026-09-05')).count, 0);
 });
+
+// ---------- Salida en lote y verificación de ubicación (servidor propio, no altera los conteos de arriba) ----------
+
+async function world(env = {}) {
+  const { app, base: b } = await start(env);
+  const a = client(b);
+  assert.equal((await a.post('/api/setup', { name: 'Admin', username: 'admin', password: '123456' })).status, 200);
+  const ids = {};
+  const clients = { admin: a };
+  for (const [key, role] of [['caja', 'local'], ['ma', 'driver'], ['mb', 'driver'], ['mc', 'driver'], ['md', 'driver'], ['me', 'driver']]) {
+    const username = `u-${key}`;
+    const r = await a.post('/api/users', { name: key.toUpperCase(), username, password: 'abcdef', role });
+    assert.equal(r.status, 200, JSON.stringify(r.data));
+    ids[key] = r.data.user.id;
+    clients[key] = client(b);
+    assert.equal((await clients[key].post('/api/login', { username, password: 'abcdef' })).status, 200);
+  }
+  // Crea un pedido listo, asignado a driverKey (o sin asignar si es null), con destino opcional.
+  async function readyOrder(driverKey, extra = {}) {
+    const o = (await clients.caja.post('/api/orders', { address: `Calle ${Math.random().toString(36).slice(2, 7)}`, ...extra })).data.order;
+    assert.equal((await clients.caja.post('/api/action', { orderId: o.id, action: 'ready' })).status, 200);
+    if (driverKey) assert.equal((await clients.caja.post('/api/action', { orderId: o.id, action: 'assign', driverId: ids[driverKey] })).status, 200);
+    return o.id;
+  }
+  async function inTransit(driverKey, extra) {
+    const id = await readyOrder(driverKey, extra);
+    assert.equal((await clients[driverKey].post('/api/action', { orderId: id, action: 'depart' })).status, 200);
+    return id;
+  }
+  const order = (id) => app.db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
+  return { app, base: b, c: clients, ids, readyOrder, inTransit, order };
+}
+
+test('salida en lote: misma hora, vuelta común y un evento por pedido', async () => {
+  const w = await world();
+  const ids = [await w.readyOrder('ma'), await w.readyOrder('ma'), await w.readyOrder('ma')];
+  const r = await w.c.ma.post('/api/action', { action: 'depart_batch', orderIds: ids.map((id, i) => (i === 0 ? `DESPACHO:${id}` : id)) });
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.match(r.data.tripId, /^V-/);
+  assert.equal(r.data.orders.length, 3);
+  const dep = new Set(r.data.orders.map((o) => o.departedAt));
+  assert.equal(dep.size, 1);
+  for (const o of r.data.orders) {
+    assert.equal(o.status, 'in_transit');
+    assert.equal(o.tripId, r.data.tripId);
+    assert.equal('total' in o, false);
+  }
+  const ev = w.app.db.prepare(`SELECT order_id, at, data_json FROM order_events WHERE action = 'depart' AND order_id IN (?, ?, ?)`).all(...ids);
+  assert.equal(ev.length, 3);
+  assert.deepEqual(new Set(ev.map((e) => e.order_id)), new Set(ids));
+  for (const e of ev) {
+    assert.equal(e.at, [...dep][0]);
+    assert.equal(JSON.parse(e.data_json).tripId, r.data.tripId);
+  }
+  // La entrega sigue siendo por pedido.
+  const d1r = await w.c.ma.post('/api/action', { orderId: ids[0], action: 'deliver' });
+  assert.equal(d1r.data.order.status, 'delivered');
+  const st = (await w.c.ma.get('/api/state')).data.orders.filter((o) => ids.includes(o.id));
+  assert.deepEqual(st.map((o) => o.status).sort(), ['delivered', 'in_transit', 'in_transit']);
+  // Salida individual: sin vuelta.
+  const single = await w.c.ma.post('/api/action', { orderId: await w.readyOrder('ma'), action: 'depart' });
+  assert.equal(single.data.order.tripId, null);
+  // Local también puede (mismo motorista).
+  const two = [await w.readyOrder('mb'), await w.readyOrder('mb')];
+  const lr = await w.c.caja.post('/api/action', { action: 'depart_batch', orderIds: two });
+  assert.equal(lr.status, 200);
+  assert.ok('total' in lr.data.orders[0]);
+});
+
+test('salida en lote: todo o nada (no listo, ajeno, motoristas distintos, límites)', async () => {
+  const w = await world();
+  const okA = await w.readyOrder('ma');
+  const okB = await w.readyOrder('ma');
+  const prep = (await w.c.caja.post('/api/orders', { address: 'Aún cocinando' })).data.order.id;
+  await w.c.caja.post('/api/action', { orderId: prep, action: 'assign', driverId: w.ids.ma });
+  const untouched = () => [okA, okB].every((id) => { const o = w.order(id); return o.status === 'ready' && o.trip_id === null && o.departed_at === null; });
+
+  const notReady = await w.c.ma.post('/api/action', { action: 'depart_batch', orderIds: [okA, prep, okB] });
+  assert.equal(notReady.status, 409);
+  assert.equal(notReady.data.error, 'invalid_transition');
+  assert.equal(notReady.data.orderId, prep);
+  assert.ok(notReady.data.message.includes(prep));
+  assert.ok(untouched());
+  assert.equal(w.app.db.prepare(`SELECT COUNT(*) AS n FROM order_events WHERE action = 'depart'`).get().n, 0);
+
+  const foreign = await w.readyOrder('mb');
+  const fr = await w.c.ma.post('/api/action', { action: 'depart_batch', orderIds: [okA, foreign] });
+  assert.equal(fr.status, 404);
+  assert.equal(fr.data.orderId, foreign);
+  assert.ok(untouched());
+  assert.equal(w.order(foreign).status, 'ready');
+
+  const mixed = await w.c.caja.post('/api/action', { action: 'depart_batch', orderIds: [okA, foreign] });
+  assert.equal(mixed.status, 409);
+  assert.equal(mixed.data.orderId, foreign);
+  const unassigned = await w.readyOrder(null);
+  assert.equal((await w.c.caja.post('/api/action', { action: 'depart_batch', orderIds: [unassigned] })).status, 409);
+  assert.equal((await w.c.ma.post('/api/action', { action: 'depart_batch', orderIds: [okA, 'P-999999'] })).status, 404);
+  assert.ok(untouched());
+
+  const many = Array.from({ length: 21 }, (_, i) => `P-${2000 + i}`);
+  assert.equal((await w.c.ma.post('/api/action', { action: 'depart_batch', orderIds: many })).status, 400);
+  assert.equal((await w.c.ma.post('/api/action', { action: 'depart_batch', orderIds: [] })).status, 400);
+  assert.equal((await w.c.ma.post('/api/action', { action: 'depart_batch', orderIds: 'P-1001' })).status, 400);
+  assert.equal((await w.c.ma.post('/api/action', { action: 'depart_batch', orderIds: [okA, okA] })).status, 400);
+  assert.ok(untouched());
+  assert.equal((await w.c.ma.post('/api/action', { action: 'depart_batch', orderIds: [okA, okB] })).status, 200);
+});
+
+// Destino conocido en Melipilla; 0,001° de latitud ≈ 111 m.
+const DEST = { lat: -33.6850, lng: -71.2150 };
+
+test('verificación de ubicación: ok, lejos, precisión mala, sin destino y sin ubicación', async () => {
+  const w = await world();
+  const ok = await w.inTransit('ma', DEST);
+  const r1 = await w.c.ma.post('/api/action', { orderId: ok, action: 'deliver', lat: DEST.lat + 0.0009, lng: DEST.lng, accuracy: 15 });
+  assert.equal(r1.status, 200);
+  assert.equal(r1.data.order.deliveryCheck, 'ok');
+  assert.ok(r1.data.order.deliveryDistanceM >= 95 && r1.data.order.deliveryDistanceM <= 105, String(r1.data.order.deliveryDistanceM));
+  assert.equal(r1.data.order.deliveryBurst, false);
+
+  // Lejos (~856 m): se registra igual como entregado.
+  const far = await w.inTransit('mb', DEST);
+  const r2 = await w.c.mb.post('/api/action', { orderId: far, action: 'deliver', lat: DEST.lat + 0.0077, lng: DEST.lng, accuracy: 10 });
+  assert.equal(r2.status, 200);
+  assert.equal(r2.data.order.status, 'delivered');
+  assert.ok(r2.data.order.deliveredAt);
+  assert.equal(r2.data.order.deliveryCheck, 'far');
+  assert.ok(r2.data.order.deliveryDistanceM > 840 && r2.data.order.deliveryDistanceM < 870);
+
+  // En la dirección pero con precisión peor que el umbral: far. (Admin: sin revisión de ráfaga.)
+  const acc = await w.inTransit('mc', DEST);
+  const r3 = await w.c.admin.post('/api/action', { orderId: acc, action: 'deliver', lat: DEST.lat, lng: DEST.lng, accuracy: 500 });
+  assert.equal(r3.data.order.deliveryCheck, 'far');
+  assert.equal(r3.data.order.deliveryDistanceM, 0);
+
+  const noDest = await w.inTransit('me');
+  const r4 = await w.c.me.post('/api/action', { orderId: noDest, action: 'deliver', lat: -33.68, lng: -71.21, accuracy: 5 });
+  assert.equal(r4.data.order.deliveryCheck, 'no_destination');
+  assert.equal(r4.data.order.deliveryDistanceM, null);
+
+  const noLoc = await w.inTransit('md', DEST);
+  const r5 = await w.c.md.post('/api/action', { orderId: noLoc, action: 'deliver' });
+  assert.equal(r5.data.order.status, 'delivered');
+  assert.equal(r5.data.order.deliveryCheck, 'no_location');
+  assert.equal(r5.data.order.deliveryDistanceM, null);
+
+  // Evento con la verificación.
+  const ev = JSON.parse(w.app.db.prepare(`SELECT data_json FROM order_events WHERE order_id = ? AND action = 'deliver'`).get(far).data_json);
+  assert.equal(ev.check, 'far');
+
+  // Métricas: far (2) + no_location (1) = 3 con observación.
+  const m = (await w.c.caja.get('/api/state')).data.metrics;
+  assert.equal(m.locationFlaggedCount, 3);
+  assert.deepEqual(m.locationChecks, { ok: 1, far: 2, noLocation: 1, noDestination: 1, burst: 0 });
+  // CSV con columnas nuevas.
+  const csv = (await w.c.admin.get('/api/export.csv')).data.replace(/^﻿/, '').trim().split('\r\n');
+  const head = csv[0].split(';');
+  for (const col of ['vuelta', 'distancia_entrega_m', 'verificacion_ubicacion', 'rafaga']) assert.ok(head.includes(col), col);
+  const row = csv.find((l) => l.startsWith(`${far};`)).split(';');
+  assert.equal(row[head.indexOf('verificacion_ubicacion')], 'far');
+  assert.ok(Number(row[head.indexOf('distancia_entrega_m')]) > 840);
+});
+
+test('umbral DELIVERY_WARN_METERS configurable', async () => {
+  const w = await world({ DELIVERY_WARN_METERS: '1000' });
+  const id = await w.inTransit('ma', DEST);
+  const r = await w.c.ma.post('/api/action', { orderId: id, action: 'deliver', lat: DEST.lat + 0.0077, lng: DEST.lng, accuracy: 10 });
+  assert.equal(r.data.order.deliveryCheck, 'ok');
+  assert.equal((await w.c.ma.get('/api/state')).data.deliveryWarnMeters, 1000);
+});
+
+test('ráfaga: dos entregas en menos de 60 s lejos entre sí quedan marcadas; cercanas no', async () => {
+  const w = await world();
+  // Mismo edificio: ambas ok y cercanas => sin ráfaga.
+  const n1 = await w.inTransit('me', DEST);
+  const n2 = await w.inTransit('me', DEST);
+  await w.c.me.post('/api/action', { orderId: n1, action: 'deliver', lat: DEST.lat, lng: DEST.lng, accuracy: 10 });
+  const rn = await w.c.me.post('/api/action', { orderId: n2, action: 'deliver', lat: DEST.lat + 0.0001, lng: DEST.lng, accuracy: 10 });
+  assert.equal(rn.data.order.deliveryBurst, false);
+  assert.equal(w.order(n1).delivery_burst, 0);
+
+  // Destinos a ~2 km, cada entrega en su destino (ok), pero con segundos de diferencia => ráfaga.
+  const DEST2 = { lat: DEST.lat + 0.018, lng: DEST.lng };
+  const a = await w.inTransit('md', DEST);
+  const b = await w.inTransit('md', DEST2);
+  const ra = await w.c.md.post('/api/action', { orderId: a, action: 'deliver', lat: DEST.lat, lng: DEST.lng, accuracy: 10 });
+  assert.equal(ra.data.order.deliveryBurst, false);
+  const rb = await w.c.md.post('/api/action', { orderId: b, action: 'deliver', lat: DEST2.lat, lng: DEST2.lng, accuracy: 10 });
+  assert.equal(rb.status, 200);
+  assert.equal(rb.data.order.status, 'delivered');
+  assert.equal(rb.data.order.deliveryCheck, 'ok');
+  assert.equal(rb.data.order.deliveryBurst, true);
+  assert.equal(w.order(a).delivery_burst, 1, 'la entrega anterior también queda marcada');
+  assert.equal(JSON.parse(w.app.db.prepare(`SELECT data_json FROM order_events WHERE order_id = ? AND action = 'deliver'`).get(b).data_json).burstWith, a);
+
+  // Una de las dos "far" (aunque estén juntas) => ráfaga.
+  const c1 = await w.inTransit('mc', DEST);
+  const c2 = await w.inTransit('mc', DEST);
+  await w.c.mc.post('/api/action', { orderId: c1, action: 'deliver', lat: DEST.lat + 0.0077, lng: DEST.lng, accuracy: 10 });
+  const rc = await w.c.mc.post('/api/action', { orderId: c2, action: 'deliver', lat: DEST.lat + 0.0077, lng: DEST.lng, accuracy: 10 });
+  assert.equal(rc.data.order.deliveryBurst, true);
+
+  // Fuera de la ventana de 60 s no hay ráfaga.
+  const old = await w.inTransit('mb', DEST);
+  await w.c.mb.post('/api/action', { orderId: old, action: 'deliver', lat: DEST.lat, lng: DEST.lng, accuracy: 10 });
+  w.app.db.prepare('UPDATE orders SET delivered_at = ? WHERE id = ?').run(new Date(Date.now() - 61000).toISOString(), old);
+  const later = await w.inTransit('mb', DEST2);
+  const rl = await w.c.mb.post('/api/action', { orderId: later, action: 'deliver', lat: DEST2.lat, lng: DEST2.lng, accuracy: 10 });
+  assert.equal(rl.data.order.deliveryBurst, false);
+
+  const m = (await w.c.admin.get('/api/state')).data.metrics;
+  // a, b (ráfaga, ok) + c1, c2 (far y ráfaga) = 4 con observación.
+  assert.equal(m.locationChecks.burst, 4);
+  assert.equal(m.locationFlaggedCount, 4);
+});
+
+test('migración: base creada sin las columnas nuevas conserva sus datos', async () => {
+  const { DatabaseSync } = await import('node:sqlite');
+  const file = path.join(tmp, 'vieja.sqlite');
+  const old = new DatabaseSync(file);
+  old.exec(`CREATE TABLE orders (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE, source TEXT NOT NULL, external_id TEXT UNIQUE,
+      channel TEXT NOT NULL, branch TEXT NOT NULL, customer_name TEXT NOT NULL DEFAULT '', customer_phone TEXT NOT NULL DEFAULT '',
+      address TEXT NOT NULL DEFAULT '', address_detail TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '',
+      lat REAL, lng REAL, delivery_fee INTEGER, total INTEGER, items_json TEXT NOT NULL DEFAULT '[]', promised_at TEXT,
+      status TEXT NOT NULL, external_status TEXT, pickup INTEGER NOT NULL DEFAULT 0, driver_id INTEGER,
+      created_at TEXT NOT NULL, ready_at TEXT, departed_at TEXT, delivered_at TEXT,
+      delivery_lat REAL, delivery_lng REAL, delivery_accuracy REAL, external_ts INTEGER, updated_at TEXT NOT NULL)`);
+  const now = new Date().toISOString();
+  old.prepare(`INSERT INTO orders (id, source, channel, branch, address, status, created_at, delivered_at, updated_at)
+    VALUES ('P-1001', 'manual', 'meson', 'Melipilla', 'Antigua 1', 'delivered', ?, ?, ?)`).run(now, now, now);
+  old.close();
+
+  const app = createApp({ dbPath: file, env: { PUBLIC_ORIGIN: ORIGIN } });
+  apps.push(app);
+  const cols = new Set(app.db.prepare('PRAGMA table_info(orders)').all().map((c) => c.name));
+  for (const c of ['trip_id', 'delivery_distance_m', 'delivery_check', 'delivery_burst']) assert.ok(cols.has(c), c);
+  const row = app.db.prepare('SELECT * FROM orders WHERE id = ?').get('P-1001');
+  assert.equal(row.address, 'Antigua 1');
+  assert.equal(row.status, 'delivered');
+  assert.equal(row.delivery_burst, 0);
+  assert.equal(row.delivery_check, null);
+  await app.close();
+  // Reabrir no falla (las columnas ya existen) y la API expone los campos nuevos vacíos.
+  const again = createApp({ dbPath: file, env: { PUBLIC_ORIGIN: ORIGIN } });
+  apps.push(again);
+  await new Promise((r) => again.server.listen(0, '127.0.0.1', r));
+  const c = client(`http://127.0.0.1:${again.server.address().port}`);
+  assert.equal((await c.post('/api/setup', { name: 'A', username: 'admin', password: '123456' })).status, 200);
+  const st = (await c.get('/api/state')).data;
+  const o = st.orders.find((x) => x.id === 'P-1001');
+  assert.deepEqual([o.tripId, o.deliveryCheck, o.deliveryDistanceM, o.deliveryBurst], [null, null, null, false]);
+  assert.equal(st.metrics.locationFlaggedCount, 0);
+});

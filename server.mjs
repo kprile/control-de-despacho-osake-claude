@@ -28,6 +28,9 @@ const ACTIVE_STATUSES = ['preparing', 'ready', 'in_transit'];
 const DEFAULT_BRANCH = 'Melipilla';
 const LOGIN_MAX_FAILS = 10;
 const LOGIN_WINDOW_MS = 5 * 60 * 1000;
+const BATCH_MAX = 20;                 // pedidos por salida en lote
+const BURST_WINDOW_MS = 60 * 1000;    // entregas del mismo motorista más juntas que esto se revisan
+const DEFAULT_WARN_METERS = 300;
 const scrypt = promisify(crypto.scrypt);
 
 // ---------- Configuración ----------
@@ -55,6 +58,7 @@ function buildConfig(env) {
     // Normaliza mayúsculas y puerto por defecto, como lo envía el navegador en Origin.
     .map((s) => { try { const u = new URL(s); return u.origin === 'null' ? s : u.origin; } catch { return s; } });
   const days = Number(env.SESSION_DAYS);
+  const warn = Number(env.DELIVERY_WARN_METERS);
   return {
     host: env.HOST || '127.0.0.1',
     port: Number(env.PORT) || 4317,
@@ -64,6 +68,8 @@ function buildConfig(env) {
     webhookSecret: env.MERCAT_WEBHOOK_SECRET || '',
     dbPath: env.DB_PATH === ':memory:' ? ':memory:' : path.resolve(ROOT, env.DB_PATH || 'data/despachos.sqlite'),
     sessionDays: Number.isFinite(days) && days > 0 ? days : 14,
+    deliveryWarnMeters: env.DELIVERY_WARN_METERS !== undefined && env.DELIVERY_WARN_METERS !== '' && Number.isFinite(warn) && warn > 0
+      ? warn : DEFAULT_WARN_METERS,
   };
 }
 
@@ -133,15 +139,26 @@ function parseExternalTime(value) {
 
 const nowIso = () => new Date().toISOString();
 
+// Distancia en metros entre dos puntos (fórmula haversine, radio medio terrestre).
+export function haversineMeters(lat1, lng1, lat2, lng2) {
+  const R = 6371008.8;
+  const rad = (d) => (d * Math.PI) / 180;
+  const dLat = rad(lat2 - lat1);
+  const dLng = rad(lng2 - lng1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(rad(lat1)) * Math.cos(rad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(a)));
+}
+const hasPoint = (lat, lng) => typeof lat === 'number' && typeof lng === 'number' && Number.isFinite(lat) && Number.isFinite(lng);
+
 // ---------- Errores y validación ----------
 
 class HttpError extends Error {
-  constructor(status, code, message) { super(message); this.status = status; this.code = code; }
+  constructor(status, code, message, extra = null) { super(message); this.status = status; this.code = code; this.extra = extra; }
 }
 const bad = (message) => new HttpError(400, 'bad_request', message);
 const forbidden = (message = 'No tienes permiso para esta acción.') => new HttpError(403, 'forbidden', message);
-const notFound = (message = 'No encontrado.') => new HttpError(404, 'not_found', message);
-const conflict = (message) => new HttpError(409, 'invalid_transition', message);
+const notFound = (message = 'No encontrado.', extra = null) => new HttpError(404, 'not_found', message, extra);
+const conflict = (message, extra = null) => new HttpError(409, 'invalid_transition', message, extra);
 
 function optText(value, max, label) {
   if (value === undefined || value === null) return '';
@@ -303,7 +320,24 @@ function openDb(dbPath) {
       updated_by INTEGER
     );
   `);
+  migrate(db);
   return db;
+}
+
+// Columnas agregadas después del esquema inicial. Una base existente (creada por una versión anterior)
+// las recibe con ALTER TABLE ... ADD COLUMN sin tocar sus datos; en una base nueva se agregan igual.
+const ORDER_COLUMNS_ADDED = [
+  ['trip_id', 'TEXT'],                              // vuelta compartida de una salida en lote
+  ['delivery_distance_m', 'INTEGER'],               // distancia GPS entrega ↔ destino, metros
+  ['delivery_check', 'TEXT'],                       // ok | far | no_location | no_destination
+  ['delivery_burst', 'INTEGER NOT NULL DEFAULT 0'], // 1 si fue parte de una ráfaga de entregas
+];
+function migrate(db) {
+  const have = new Set(db.prepare('PRAGMA table_info(orders)').all().map((c) => c.name));
+  for (const [name, type] of ORDER_COLUMNS_ADDED) {
+    if (!have.has(name)) db.exec(`ALTER TABLE orders ADD COLUMN ${name} ${type}`);
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS orders_trip ON orders(trip_id)');
 }
 
 function tx(db, fn) {
@@ -521,6 +555,8 @@ export function createApp({ dbPath, env = process.env, publicDir = path.join(ROO
     orderByExternal: db.prepare('SELECT * FROM orders WHERE external_id = ?'),
     insertEvent: db.prepare('INSERT INTO order_events (order_id, at, user_id, actor, action, from_status, to_status, note, data_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'),
     costsByMonth: db.prepare('SELECT * FROM monthly_costs WHERE month = ?'),
+    lastDeliveryByDriver: db.prepare(`SELECT id, delivered_at, delivery_lat, delivery_lng, delivery_check, delivery_burst FROM orders
+      WHERE driver_id = ? AND status = 'delivered' AND delivered_at >= ? AND id <> ? ORDER BY delivered_at DESC, seq DESC LIMIT 1`),
   };
 
   // ----- sesiones -----
@@ -589,6 +625,9 @@ export function createApp({ dbPath, env = process.env, publicDir = path.join(ROO
       driverId: o.driver_id, driverName: o.driver_name ?? null,
       createdAt: o.created_at, readyAt: o.ready_at, departedAt: o.departed_at, deliveredAt: o.delivered_at,
       deliveryLat: o.delivery_lat, deliveryLng: o.delivery_lng, deliveryAccuracy: o.delivery_accuracy,
+      tripId: o.trip_id ?? null,
+      deliveryDistanceM: o.delivery_distance_m ?? null, deliveryCheck: o.delivery_check ?? null,
+      deliveryBurst: !!o.delivery_burst,
       incidents: incidents.get(o.id) || [],
     };
     if (role === 'driver') delete out.total;
@@ -617,9 +656,9 @@ export function createApp({ dbPath, env = process.env, publicDir = path.join(ROO
     const cols = Object.keys(fields);
     db.prepare(`UPDATE orders SET ${cols.map((c) => `${c} = ?`).join(', ')} WHERE id = ?`).run(...cols.map((c) => fields[c]), id);
   }
-  function logEvent(orderId, user, action, from, to, note = null, data = null) {
+  function logEvent(orderId, user, action, from, to, note = null, data = null, at = nowIso()) {
     sheets.markDirty();
-    q.insertEvent.run(orderId, nowIso(), user?.id ?? null, user?.name ?? 'Mercat', action, from, to, note,
+    q.insertEvent.run(orderId, at, user?.id ?? null, user?.name ?? 'Mercat', action, from, to, note,
       data ? JSON.stringify(data) : null);
   }
 
@@ -679,6 +718,64 @@ export function createApp({ dbPath, env = process.env, publicDir = path.join(ROO
     cancel: ['admin', 'local'],
   };
 
+  // ok: dentro del umbral; far: más lejos que el umbral o precisión GPS peor que el umbral;
+  // no_location: el motorista no envió ubicación; no_destination: el pedido no tiene coordenadas de destino.
+  function deliveryCheck(o, lat, lng, accuracy) {
+    if (!hasPoint(lat, lng)) return { check: 'no_location', distanceM: null };
+    if (!hasPoint(o.lat, o.lng)) return { check: 'no_destination', distanceM: null };
+    const distanceM = Math.round(haversineMeters(lat, lng, o.lat, o.lng));
+    const warn = config.deliveryWarnMeters;
+    const far = distanceM > warn || (typeof accuracy === 'number' && accuracy > warn);
+    return { check: far ? 'far' : 'ok', distanceM };
+  }
+  // Ráfaga: otra entrega del mismo motorista hace < 60 s y ambas lejos entre sí, o alguna de las dos "far".
+  function isBurst(prev, check, lat, lng) {
+    if (check === 'far' || prev.delivery_check === 'far') return true;
+    return hasPoint(lat, lng) && hasPoint(prev.delivery_lat, prev.delivery_lng)
+      && haversineMeters(lat, lng, prev.delivery_lat, prev.delivery_lng) > config.deliveryWarnMeters;
+  }
+
+  // Salida en lote: todos los pedidos listos, del mismo motorista; todo o nada.
+  function departBatch(body, user) {
+    if (!ACTION_ROLES.depart.includes(user.role)) throw forbidden();
+    const raw = body.orderIds;
+    if (!Array.isArray(raw) || raw.length === 0) throw bad('orderIds debe ser una lista con al menos un pedido.');
+    if (raw.length > BATCH_MAX) throw bad(`Una salida admite como máximo ${BATCH_MAX} pedidos.`);
+    const ids = [];
+    for (const v of raw) {
+      let id;
+      try { id = normalizeOrderId(v); } catch (err) {
+        const shown = String(v).slice(0, 40);
+        if (err instanceof HttpError && err.status === 404) throw notFound(`Pedido ${shown} no encontrado.`, { orderId: shown });
+        throw err;
+      }
+      if (ids.includes(id)) throw bad(`El pedido ${id} está repetido en la salida.`);
+      ids.push(id);
+    }
+    return tx(db, () => {
+      const rows = [];
+      let driverId = null;
+      for (const id of ids) {
+        const o = q.orderById.get(id);
+        if (!o || (user.role === 'driver' && o.driver_id !== user.id)) throw notFound(`Pedido ${id} no encontrado.`, { orderId: id });
+        const need = (ok, msg) => { if (!ok) throw conflict(`${id}: ${msg}`, { orderId: id }); };
+        need(!o.pickup, 'un pedido de retiro no se despacha.');
+        need(o.status === 'ready', `solo un pedido listo puede salir (estado actual: ${o.status}).`);
+        need(!!o.driver_id, 'el pedido no tiene motorista asignado.');
+        if (driverId === null) driverId = o.driver_id;
+        need(o.driver_id === driverId, 'todos los pedidos de una salida deben estar asignados al mismo motorista.');
+        rows.push(o);
+      }
+      const now = nowIso();
+      const tripId = `V-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
+      for (const o of rows) {
+        updateOrder(o.id, { status: 'in_transit', departed_at: now, trip_id: tripId, updated_at: now });
+        logEvent(o.id, user, 'depart', 'ready', 'in_transit', null, { tripId, batchSize: rows.length }, now);
+      }
+      return { ids, tripId };
+    });
+  }
+
   function applyAction(body, user) {
     const action = body.action;
     if (typeof action !== 'string' || !ACTION_ROLES[action]) throw bad('Acción inválida.');
@@ -718,9 +815,25 @@ export function createApp({ dbPath, env = process.env, publicDir = path.join(ROO
           const lng = optCoord(body.lng, -180, 180, 'Longitud');
           const accuracy = optCoord(body.accuracy, 0, 100000, 'Precisión');
           if ((lat === null) !== (lng === null)) throw bad('Debes enviar latitud y longitud juntas.');
+          const acc = lat === null ? null : accuracy;
+          // Aviso de ubicación: se registra, nunca bloquea la entrega (el GPS falla en interiores).
+          const chk = deliveryCheck(o, lat, lng, acc);
+          let burstWith = null;
+          if (user.role === 'driver') {
+            const prev = q.lastDeliveryByDriver.get(user.id, new Date(Date.parse(now) - BURST_WINDOW_MS).toISOString(), o.id);
+            if (prev && isBurst(prev, chk.check, lat, lng)) burstWith = prev;
+          }
           updateOrder(o.id, { status: 'delivered', delivered_at: now, delivery_lat: lat, delivery_lng: lng,
-            delivery_accuracy: lat === null ? null : accuracy, updated_at: now });
-          logEvent(o.id, user, action, st, 'delivered', null, lat === null ? null : { lat, lng, accuracy });
+            delivery_accuracy: acc, delivery_distance_m: chk.distanceM, delivery_check: chk.check,
+            delivery_burst: burstWith ? 1 : 0, updated_at: now });
+          logEvent(o.id, user, action, st, 'delivered', null, {
+            ...(lat === null ? {} : { lat, lng, accuracy: acc }),
+            distanceM: chk.distanceM, check: chk.check, ...(burstWith ? { burstWith: burstWith.id } : {}),
+          });
+          if (burstWith && !burstWith.delivery_burst) {
+            updateOrder(burstWith.id, { delivery_burst: 1, updated_at: now });
+            logEvent(burstWith.id, user, 'burst_flag', 'delivered', 'delivered', null, { burstWith: o.id });
+          }
           break;
         }
         case 'incident': {
@@ -900,6 +1013,7 @@ export function createApp({ dbPath, env = process.env, publicDir = path.join(ROO
       deliveredCount: rows.filter((o) => o.status === 'delivered').length,
       failedCount: rows.filter((o) => o.status === 'failed').length,
       canceledCount: rows.filter((o) => o.status === 'canceled').length,
+      ...locationStats(rows),
       byDriver: [...byDriver].map(([driverId, d]) => ({
         driverId, name: d.name, deliveries: d.deliveries, routeAvgMinutes: avgOf(d.routes).avgMinutes,
       })).sort((a, b) => b.deliveries - a.deliveries),
@@ -907,6 +1021,23 @@ export function createApp({ dbPath, env = process.env, publicDir = path.join(ROO
         channel, orders: c.orders, totalAvgMinutes: avgOf(c.totals).avgMinutes,
       })).sort((a, b) => b.orders - a.orders),
     };
+  }
+
+  // Entregas con observación de ubicación (far, no_location o ráfaga). Entregas anteriores a esta
+  // función no tienen verificación (delivery_check NULL) y no se cuentan.
+  function locationStats(rows) {
+    const c = { ok: 0, far: 0, noLocation: 0, noDestination: 0, burst: 0 };
+    let flagged = 0;
+    for (const o of rows) {
+      if (o.status !== 'delivered') continue;
+      if (o.delivery_check === 'ok') c.ok++;
+      else if (o.delivery_check === 'far') c.far++;
+      else if (o.delivery_check === 'no_location') c.noLocation++;
+      else if (o.delivery_check === 'no_destination') c.noDestination++;
+      if (o.delivery_burst) c.burst++;
+      if (o.delivery_check === 'far' || o.delivery_check === 'no_location' || o.delivery_burst) flagged++;
+    }
+    return { locationFlaggedCount: flagged, locationChecks: c };
   }
 
   function computeCosts(month) {
@@ -944,6 +1075,7 @@ export function createApp({ dbPath, env = process.env, publicDir = path.join(ROO
     const state = {
       user: publicUser(user),
       serverTime: nowIso(),
+      deliveryWarnMeters: config.deliveryWarnMeters,
       orders: rows.map((r) => toOrder(r, inc, role)),
       drivers: [], users: [], branches: [], metrics: null, costs: null,
     };
@@ -988,7 +1120,8 @@ export function createApp({ dbPath, env = process.env, publicDir = path.join(ROO
   function buildCsv(filters) {
     const header = ['id', 'fecha', 'origen', 'canal', 'sucursal', 'estado', 'estado_mercat', 'motorista', 'cliente',
       'direccion', 'tarifa_despacho', 'total', 'creado', 'listo', 'salida', 'entrega',
-      'min_preparacion', 'min_espera', 'min_ruta', 'min_total'];
+      'min_preparacion', 'min_espera', 'min_ruta', 'min_total',
+      'vuelta', 'distancia_entrega_m', 'verificacion_ubicacion', 'rafaga'];
     const fmt = (n) => (n === null ? '' : round1(n).toFixed(1).replace('.', ','));
     const lines = [header.join(';')];
     for (const o of ordersInRange(filters)) {
@@ -998,6 +1131,7 @@ export function createApp({ dbPath, env = process.env, publicDir = path.join(ROO
         o.customer_name, [o.address, o.address_detail].filter(Boolean).join(', '), o.delivery_fee, o.total,
         chileDateTime(o.created_at), chileDateTime(o.ready_at), chileDateTime(o.departed_at), chileDateTime(o.delivered_at),
         fmt(iv.prep), fmt(iv.wait), fmt(iv.route), fmt(iv.total),
+        o.trip_id, o.delivery_distance_m, o.delivery_check, o.status === 'delivered' ? (o.delivery_burst ? 'si' : 'no') : '',
       ].map(csvCell).join(';'));
     }
     return '﻿' + lines.join('\r\n') + '\r\n';
@@ -1141,7 +1275,12 @@ export function createApp({ dbPath, env = process.env, publicDir = path.join(ROO
 
       case 'POST /api/action': {
         const { user } = requireUser(req);
-        const id = applyAction(await readBody(req), user);
+        const body = await readBody(req);
+        if (body.action === 'depart_batch') {
+          const { ids, tripId } = departBatch(body, user);
+          return send(res, 200, { tripId, orders: ids.map((id) => loadOrder(id, user.role)) });
+        }
+        const id = applyAction(body, user);
         return send(res, 200, { order: loadOrder(id, user.role) });
       }
 
@@ -1238,7 +1377,7 @@ export function createApp({ dbPath, env = process.env, publicDir = path.join(ROO
       else serveStatic(req, res, url);
     } catch (err) {
       if (err instanceof HttpError) {
-        if (!res.headersSent) send(res, err.status, { error: err.code, message: err.message }, err.status === 413 ? { Connection: 'close' } : {});
+        if (!res.headersSent) send(res, err.status, { error: err.code, message: err.message, ...(err.extra || {}) }, err.status === 413 ? { Connection: 'close' } : {});
       } else {
         console.error('[error]', err);
         if (!res.headersSent) send(res, 500, { error: 'server_error', message: 'Error interno del servidor.' });

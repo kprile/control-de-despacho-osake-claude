@@ -44,7 +44,9 @@
     timer: null,
     costsFilledFor: null,
     metricsFilled: false,
+    batch: new Set(),     // ids de pedidos listos seleccionados para la próxima salida (motorista)
   };
+  const BATCH_MAX = 20;
 
   const $ = (sel, root = document) => root.querySelector(sel);
   const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
@@ -76,6 +78,8 @@
   const money = (n) => (n === null || n === undefined || n === '' || Number.isNaN(Number(n)) ? '—' : clp.format(Number(n)));
   const minutes = (n) => (n === null || n === undefined || Number.isNaN(Number(n)) ? '—' : `${dec1.format(Number(n))} min`);
   const plural = (n, one, many) => `${intFmt.format(n)} ${n === 1 ? one : many}`;
+  const meters = (n) => (n === null || n === undefined || !Number.isFinite(Number(n)) ? '—'
+    : Number(n) < 1000 ? `${intFmt.format(Math.round(Number(n)))} m` : `${dec1.format(Number(n) / 1000)} km`);
   const hhmm = (iso) => (iso ? timeFmt.format(new Date(iso)) : '');
   const ddhhmm = (iso) => (iso ? dateTimeFmt.format(new Date(iso)) : '');
   const chileDate = (msOrIso) => ymdFmt.format(new Date(msOrIso));
@@ -137,7 +141,7 @@
 
   // ---------- API ----------
   class ApiError extends Error {
-    constructor(message, status, code) { super(message); this.status = status; this.code = code; }
+    constructor(message, status, code, data = null) { super(message); this.status = status; this.code = code; this.data = data; }
   }
 
   async function api(path, { method = 'GET', body, authRedirect = true } = {}) {
@@ -161,7 +165,7 @@
     }
     if (!res.ok) {
       const msg = (data && data.message) || `Error del servidor (${res.status}).`;
-      const err = new ApiError(msg, res.status, data && data.error);
+      const err = new ApiError(msg, res.status, data && data.error, data);
       if (res.status === 401 && authRedirect) handleUnauthorized();
       throw err;
     }
@@ -214,7 +218,8 @@
   const dirtyFields = new WeakSet();
   document.addEventListener('input', (e) => {
     const t = e.target;
-    if (t instanceof HTMLElement && t.matches('input, textarea, select')) {
+    // Las casillas de selección de salida guardan su estado en app.batch: no deben frenar el refresco.
+    if (t instanceof HTMLElement && t.matches('input, textarea, select') && t.type !== 'checkbox') {
       dirtyFields.add(t);
       const form = t.closest('form');
       if (form) form.dataset.dirty = '1';
@@ -390,7 +395,39 @@
       el('span', { class: `badge badge-${o.status}`, text: STATUS_LABEL[o.status] || o.status }),
       o.pickup ? el('span', { class: 'badge badge-pickup', text: 'Retiro en local' }) : null,
       o.channel ? el('span', { class: 'badge badge-soft', text: CHANNEL_LABEL[o.channel] || o.channel }) : null,
-      isLate(o) ? el('span', { class: 'badge badge-late', text: 'Atrasado' }) : null);
+      isLate(o) ? el('span', { class: 'badge badge-late', text: 'Atrasado' }) : null,
+      o.status === 'in_transit' && o.tripId ? el('span', { class: 'badge badge-soft', text: 'Salida en lote' }) : null,
+      isStaff() && hasLocationFlag(o) ? el('span', { class: 'badge badge-warn', text: 'Revisar ubicación' }) : null);
+  }
+
+  // Entrega con observación de ubicación: lejos del destino, sin ubicación o en ráfaga.
+  function hasLocationFlag(o) {
+    return o.status === 'delivered' && (o.deliveryCheck === 'far' || o.deliveryCheck === 'no_location' || !!o.deliveryBurst);
+  }
+  const warnMeters = () => (app.data && Number(app.data.deliveryWarnMeters)) || 300;
+  function locationText(o) {
+    const parts = [];
+    switch (o.deliveryCheck) {
+      case 'ok': parts.push(`Ubicación OK: a ${meters(o.deliveryDistanceM)} del destino`); break;
+      case 'far': {
+        let t = `Lejos del destino: a ${meters(o.deliveryDistanceM)}`;
+        if (o.deliveryAccuracy !== null && o.deliveryAccuracy !== undefined && Number(o.deliveryAccuracy) > warnMeters()) {
+          t += ` (GPS impreciso, ±${meters(o.deliveryAccuracy)})`;
+        }
+        parts.push(t);
+        break;
+      }
+      case 'no_location': parts.push('Entregado sin ubicación del motorista'); break;
+      case 'no_destination': parts.push('Sin coordenadas de destino: no se pudo comparar'); break;
+      default: break;
+    }
+    if (o.deliveryBurst) parts.push('ráfaga: marcado a menos de 1 min de otra entrega del motorista');
+    return parts.join(' · ');
+  }
+  function locationLine(o) {
+    if (o.status !== 'delivered') return null;
+    const txt = locationText(o);
+    return txt ? el('p', { class: `order-loc${hasLocationFlag(o) ? ' loc-warn' : ''}`, text: txt }) : null;
   }
 
   function actionBtn(label, fn, cls = '') {
@@ -434,7 +471,10 @@
     if (o.deliveryFee !== null && o.deliveryFee !== undefined) money1.push(`Delivery ${money(o.deliveryFee)}`);
     card.append(el('p', { class: 'order-meta' },
       driverTxt ? el('span', { class: o.driverName ? '' : 'warn-text', text: driverTxt }) : null,
-      money1.length ? el('span', { class: 'muted', text: money1.join(' · ') }) : null));
+      money1.length ? el('span', { class: 'muted', text: money1.join(' · ') }) : null,
+      o.tripId ? el('span', { class: 'muted', text: `Vuelta ${o.tripId}` }) : null));
+    const loc = locationLine(o);
+    if (loc) card.append(loc);
     card.append(staffActions(o));
     return card;
   }
@@ -532,7 +572,8 @@
     box.append(el('div', { class: 'tiles tiles-counters' },
       counterTile('Entregados', m.deliveredCount),
       counterTile('No entregados', m.failedCount),
-      counterTile('Cancelados', m.canceledCount)));
+      counterTile('Cancelados', m.canceledCount),
+      locationTile(m)));
 
     const drivers = m.byDriver || [];
     box.append(el('h3', { text: 'Por motorista' }));
@@ -553,6 +594,14 @@
     return el('div', { class: 'tile tile-counter' },
       el('p', { class: 'tile-title', text: title }),
       el('p', { class: 'tile-value', text: intFmt.format(Number(n) || 0) }));
+  }
+  function locationTile(m) {
+    const c = m.locationChecks || {};
+    const n = (k) => intFmt.format(Number(c[k]) || 0);
+    return el('div', { class: `tile tile-counter${Number(m.locationFlaggedCount) > 0 ? ' tile-warn' : ''}` },
+      el('p', { class: 'tile-title', text: 'Entregas con observación de ubicación' }),
+      el('p', { class: 'tile-value', text: intFmt.format(Number(m.locationFlaggedCount) || 0) }),
+      el('p', { class: 'tile-sub', text: `lejos ${n('far')} · sin ubicación ${n('noLocation')} · ráfaga ${n('burst')} · sin destino ${n('noDestination')} (no verificable)` }));
   }
   function table(headers, rows) {
     const t = el('table', { class: 'table' });
@@ -847,7 +896,27 @@
 
   // ---------- Motorista ----------
   function driverCard(o) {
-    const card = el('article', { class: `card order-card driver-card status-${o.status}`, dataset: { id: o.id } });
+    const selected = o.status === 'ready' && app.batch.has(o.id);
+    const card = el('article', { class: `card order-card driver-card status-${o.status}${selected ? ' is-selected' : ''}`, dataset: { id: o.id } });
+    if (o.status === 'ready') {
+      const cbId = `batch-${o.id}`;
+      const cb = el('input', {
+        type: 'checkbox', id: cbId, class: 'batch-check', checked: selected,
+        on: {
+          change: () => {
+            if (cb.checked && !app.batch.has(o.id) && app.batch.size >= BATCH_MAX) {
+              cb.checked = false;
+              notify(`Una salida admite como máximo ${BATCH_MAX} pedidos.`, 'error');
+              return;
+            }
+            if (cb.checked) app.batch.add(o.id); else app.batch.delete(o.id);
+            card.classList.toggle('is-selected', cb.checked);
+            updateBatchBar();
+          },
+        },
+      });
+      card.append(el('label', { class: 'batch-select', for: cbId }, cb, el('span', { text: `Llevar ${o.id} en esta salida` })));
+    }
     card.append(cardHeader(o));
     card.append(el('p', { class: 'order-time', text: timeLine(o) }));
     card.append(orderSummary(o));
@@ -878,14 +947,61 @@
     return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(query)}`;
   }
 
+  function driverGroup(key, title, list, extra) {
+    const titleId = `drv-${key}-title`;
+    const sec = el('section', { class: `driver-group group-${key}`, 'aria-labelledby': titleId },
+      el('h3', { id: titleId, class: 'group-title' }, title, el('span', { class: 'count', text: ` (${list.length})` })));
+    if (extra && extra.before) sec.append(extra.before);
+    const cards = el('div', { class: 'driver-cards' });
+    for (const o of list) cards.append(driverCard(o));
+    sec.append(cards);
+    if (extra && extra.after) sec.append(extra.after);
+    return sec;
+  }
+
+  function selectedReady() {
+    return (app.data.orders || []).filter((o) => app.batch.has(o.id) && o.status === 'ready' && !o.pickup);
+  }
+  function updateBatchBar() {
+    const bar = $('#batch-bar');
+    if (!bar) return;
+    const n = selectedReady().length;
+    show(bar, n > 0);
+    $('#btn-batch').textContent = `Salí con ${plural(n, 'pedido', 'pedidos')}`;
+  }
+  function batchBar() {
+    return el('div', { id: 'batch-bar', class: 'batch-bar', hidden: true },
+      el('button', { type: 'button', id: 'btn-batch', class: 'btn btn-primary btn-xl', text: 'Salí con 0 pedidos', on: { click: () => flowDepartBatch() } }),
+      el('button', {
+        type: 'button', class: 'btn btn-small btn-ghost', text: 'Quitar selección',
+        on: { click: () => { app.batch.clear(); renderDriver(); } },
+      }));
+  }
+
   function renderDriver() {
     const orders = app.data.orders || [];
-    const order = { in_transit: 0, ready: 1, preparing: 2 };
-    const active = orders.filter((o) => ACTIVE_STATUSES.includes(o.status) && !o.pickup)
-      .sort((a, b) => (order[a.status] - order[b.status]) || String(a.createdAt).localeCompare(String(b.createdAt)));
+    const active = orders.filter((o) => ACTIVE_STATUSES.includes(o.status) && !o.pickup);
+    const of = (s) => active.filter((o) => o.status === s).sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
+    const transit = of('in_transit');
+    const ready = of('ready');
+    const preparing = of('preparing');
+    // La selección solo conserva pedidos que siguen listos y asignados a este motorista.
+    const readyIds = new Set(ready.map((o) => o.id));
+    for (const id of [...app.batch]) if (!readyIds.has(id)) app.batch.delete(id);
+
     const box = clear($('#driver-active'));
     if (!active.length) box.append(el('p', { class: 'card muted empty', text: 'No tienes pedidos asignados por ahora.' }));
-    for (const o of active) box.append(driverCard(o));
+    if (transit.length) box.append(driverGroup('in_transit', 'En ruta', transit));
+    if (ready.length) {
+      box.append(driverGroup('ready', 'Listos para retirar', ready, {
+        before: ready.length > 1
+          ? el('p', { class: 'muted small', text: 'Marca los pedidos que llevas y toca "Salí con N pedidos", o usa "Salí" en cada uno.' })
+          : null,
+        after: batchBar(),
+      }));
+      updateBatchBar();
+    }
+    if (preparing.length) box.append(driverGroup('preparing', 'En preparación', preparing));
 
     const today = chileDate(serverNow());
     const done = orders.filter((o) => o.status === 'delivered' && o.deliveredAt && chileDate(o.deliveredAt) === today)
@@ -896,7 +1012,8 @@
       doneBox.append(el('p', { class: 'muted', text: plural(done.length, 'entrega', 'entregas') + ' hoy.' }));
       const ul = el('ul', { class: 'done-list' });
       for (const o of done) {
-        ul.append(el('li', null, el('strong', { text: `${hhmm(o.deliveredAt)} ` }), `${o.id} · ${o.address || ''}`));
+        ul.append(el('li', null, el('strong', { text: `${hhmm(o.deliveredAt)} ` }), `${o.id} · ${o.address || ''}`,
+          o.deliveryCheck === 'far' ? el('span', { class: 'warn-text', text: ` · lejos de la dirección (${meters(o.deliveryDistanceM)})` }) : null));
       }
       doneBox.append(ul);
     }
@@ -917,7 +1034,7 @@
    * Muestra un diálogo modal. Devuelve un objeto con los valores (o {} si no hay campos)
    * al confirmar, o null si se cancela.
    */
-  function ask({ title, order = null, lines = [], fields = [], confirmText = 'Confirmar', cancelText = 'Cancelar', danger = false, info = null }) {
+  function ask({ title, order = null, lines = [], items = [], fields = [], confirmText = 'Confirmar', cancelText = 'Cancelar', altText = null, danger = false, info = null }) {
     if (dlgResolve) closeDialog(null);
     $('#dlg-title').textContent = title;
     const body = clear($('#dlg-body'));
@@ -927,6 +1044,10 @@
         order.driverName ? el('p', { class: 'small', text: `Motorista: ${order.driverName}` }) : null));
     }
     for (const l of lines) body.append(el('p', { text: l }));
+    if (items.length) body.append(el('ul', { class: 'dlg-list' }, items.map((t) => el('li', { text: t }))));
+    const alt = $('#dlg-alt');
+    alt.textContent = altText || '';
+    show(alt, !!altText);
     if (info) body.append(el('p', { class: 'dlg-info', text: info }));
     const inputs = [];
     fields.forEach((f, i) => {
@@ -986,6 +1107,7 @@
     closeDialog(vals);
   });
   $('#dlg-cancel').addEventListener('click', () => closeDialog(null));
+  $('#dlg-alt').addEventListener('click', () => closeDialog({ alt: true }));
   dlg.addEventListener('cancel', (e) => { e.preventDefault(); closeDialog(null); });
   dlg.addEventListener('close', () => { if (dlgResolve && !dlg.open) closeDialog(null); });
 
@@ -1036,7 +1158,67 @@
     const pos = await getPosition();
     const extra = pos.coords ? { lat: pos.coords.lat, lng: pos.coords.lng, accuracy: pos.coords.accuracy } : {};
     const msg = pos.coords ? `Entrega registrada con ubicación (${o.id}).` : `Entrega registrada sin ubicación (${o.id}): ${pos.error}`;
-    await runAction(o, 'deliver', extra, msg);
+    const res = await runAction(o, 'deliver', extra, msg);
+    const d = res && res.order;
+    // Aviso no bloqueante: la entrega ya quedó registrada.
+    if (d && d.deliveryCheck === 'far') {
+      const dist = Number(d.deliveryDistanceM);
+      const txt = Number.isFinite(dist) && dist > warnMeters()
+        ? `Estás a ${meters(dist)} de la dirección; la entrega quedó registrada con esta observación.`
+        : `La ubicación del teléfono es imprecisa (±${meters(d.deliveryAccuracy)}); la entrega quedó registrada con esta observación.`;
+      notify(txt, 'warn', 15000);
+    }
+  }
+
+  // Salida con varios pedidos (todo o nada en el servidor).
+  async function flowDepartBatch() {
+    const sel = selectedReady();
+    if (!sel.length) { notify('Selecciona al menos un pedido listo.', 'error'); return; }
+    if (sel.length > BATCH_MAX) { notify(`Una salida admite como máximo ${BATCH_MAX} pedidos.`, 'error'); return; }
+    const n = sel.length;
+    const ok = await ask({
+      title: `Salir con ${plural(n, 'pedido', 'pedidos')}`,
+      lines: [n === 1 ? '¿Sales ahora con este pedido?' : `¿Sales ahora con estos ${n} pedidos? Todos quedan en ruta con la misma hora de salida.`],
+      items: sel.map((o) => [o.id, o.address || 'Sin dirección', o.addressDetail].filter(Boolean).join(' · ')),
+      info: 'La entrega se marca después, pedido por pedido.',
+      confirmText: n === 1 ? 'Sí, salí' : `Sí, salí con ${n}`,
+    });
+    if (!ok) return;
+    try {
+      await api('/api/action', { method: 'POST', body: { action: 'depart_batch', orderIds: sel.map((o) => o.id) } });
+      app.batch.clear();
+      notify(`Salida registrada con ${plural(n, 'pedido', 'pedidos')}.`, 'success');
+      await refresh({ force: true });
+    } catch (err) {
+      if (err.status !== 401) notify(`No se registró ninguna salida. ${err.message}`, 'error');
+      if (err.data && err.data.orderId && err.status === 404) app.batch.delete(String(err.data.orderId).toUpperCase());
+      if (err.status === 409 || err.status === 404) refresh({ force: true });
+    }
+  }
+
+  // Escaneo de un pedido listo (motorista): salir solo con él o sumarlo a la salida.
+  async function flowScanReady(o) {
+    const inSel = app.batch.has(o.id);
+    const others = selectedReady().filter((x) => x.id !== o.id).length;
+    const lines = [];
+    if (others) lines.push(`Tienes ${plural(others, 'otro pedido seleccionado', 'otros pedidos seleccionados')} para la salida.`);
+    let altText = 'Agregar a la salida';
+    if (inSel) altText = others ? `Salí con ${others + 1} pedidos` : null;
+    const res = await ask({
+      title: 'Pedido listo para retirar', order: o, lines,
+      info: inSel ? 'Este pedido ya está en la selección de la salida.' : null,
+      confirmText: 'Salir solo con este', altText,
+    });
+    if (!res) return;
+    if (res.alt) {
+      if (inSel) { await flowDepartBatch(); return; }
+      if (app.batch.size >= BATCH_MAX) { notify(`Una salida admite como máximo ${BATCH_MAX} pedidos.`, 'error'); return; }
+      app.batch.add(o.id);
+      renderDriver();
+      notify(`${o.id} agregado a la salida (${plural(selectedReady().length, 'pedido seleccionado', 'pedidos seleccionados')}).`, 'success');
+      return;
+    }
+    await runAction(o, 'depart', {}, `Salida registrada (${o.id}).`);
   }
   async function flowIncident(o) {
     const vals = await ask({
@@ -1128,7 +1310,7 @@
     if (isDriver()) {
       const mine = app.data.user && o.driverId === app.data.user.id;
       if (!mine) return { info: 'Pedido no encontrado o no asignado a ti.' };
-      if (s === 'ready') return { flow: flowDepart };
+      if (s === 'ready') return { flow: flowScanReady };
       if (s === 'in_transit') return { flow: flowDeliver };
       return { info: 'Aún en preparación. Espera a que el local lo marque listo.' };
     }
