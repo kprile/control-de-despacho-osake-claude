@@ -461,3 +461,51 @@ test('estáticos: cabeceras de seguridad y sin path traversal', async () => {
   assert.ok(r3.headers.get('referrer-policy'));
   assert.equal((await fetch(`${base}/api/nada`)).status, 404);
 });
+
+test('cookie Secure según el origen https cuando hay varios PUBLIC_ORIGIN', async () => {
+  const { base: b } = await start({ PUBLIC_ORIGIN: 'http://10.0.2.2:4317, HTTPS://Despachos.Example:443/' });
+  const c = client(b);
+  const s = await c.post('/api/setup', { name: 'A', username: 'admin', password: '123456' }, { origin: 'https://despachos.example' });
+  assert.equal(s.status, 200, JSON.stringify(s.data));
+  assert.match(s.headers.get('set-cookie'), /; Secure/);
+  const l = await client(b).post('/api/login', { username: 'admin', password: '123456' }, { origin: 'http://10.0.2.2:4317' });
+  assert.equal(l.status, 200);
+  assert.doesNotMatch(l.headers.get('set-cookie'), /Secure/);
+  const out = await c.post('/api/logout', {}, { origin: 'https://despachos.example' });
+  assert.match(out.headers.get('set-cookie'), /; Secure/);
+});
+
+test('SETUP_TOKEN con límite de intentos', async () => {
+  const { base: b } = await start({ SETUP_TOKEN: 'token-largo-1' });
+  const c = client(b);
+  for (let i = 0; i < 10; i++) {
+    assert.equal((await c.post('/api/setup', { name: 'A', username: 'admin', password: '123456', setupToken: `malo${i}` })).status, 403);
+  }
+  const r = await c.post('/api/setup', { name: 'A', username: 'admin', password: '123456', setupToken: 'token-largo-1' });
+  assert.equal(r.status, 429);
+});
+
+test('hora Chile sin zona en el salto a horario de verano (septiembre)', async () => {
+  const send = (id, created) => webhook(base, {
+    event_id: `dst-${id}`, event_type: 'orders.create', event_timestamp: '2026-09-06T05:00:00Z',
+    event_data: { id, store_id: 'DST', status: 'ready', created_at: created, user_address: 'Z 1' },
+  });
+  // 00:30 del 6-sep no existe en Chile (de 24:00 se pasa a 01:00): se lleva a 01:30 (-03), mismo día.
+  for (const [id, created, iso] of [
+    [1, '2026-09-06 00:30', '2026-09-06T04:30:00.000Z'],
+    [2, '2026-09-06 01:30', '2026-09-06T04:30:00.000Z'],
+    [3, '2026-09-05 23:30', '2026-09-06T03:30:00.000Z'],
+    [4, '2026-04-05 00:30', '2026-04-05T04:30:00.000Z'],
+  ]) {
+    const r = await webhook(base, { event_id: `dst-x${id}`, event_type: 'orders.create', event_timestamp: Date.parse(iso) + 60000,
+      event_data: { id: `x${id}`, store_id: 'DST', created_at: created, user_address: 'Z 1' } });
+    assert.equal(r.status, 200);
+    const row = apps[0].db.prepare('SELECT created_at FROM orders WHERE id = ?').get(r.data.orderId);
+    assert.equal(row.created_at, iso, created);
+  }
+  // Pedido listo creado a las "00:10" del día del cambio: cuenta para el 6-sep, no para el 5-sep.
+  assert.equal((await send(10, '2026-09-06 00:10')).status, 200);
+  const day = async (d) => (await admin.get(`/api/state?from=${d}&to=${d}&branch=DST`)).data.metrics.prep;
+  assert.deepEqual(await day('2026-09-06'), { avgMinutes: 50, count: 1 });
+  assert.equal((await day('2026-09-05')).count, 0);
+});

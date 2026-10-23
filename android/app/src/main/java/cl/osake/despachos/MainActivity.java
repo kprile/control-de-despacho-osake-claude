@@ -14,6 +14,8 @@ import android.net.http.SslError;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.Message;
 import android.view.Menu;
 import android.view.MenuItem;
@@ -463,6 +465,24 @@ public class MainActivity extends AppCompatActivity {
             return true;
         }
 
+        /**
+         * Android 6 (API 23) solo llama a esta versión: sin ella, tel:, mapas y redirecciones a otros
+         * orígenes se cargarían dentro del WebView.
+         */
+        @SuppressWarnings("deprecation")
+        @Override
+        public boolean shouldOverrideUrlLoading(WebView view, String url) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                return false; // API 24+ usa la versión con WebResourceRequest.
+            }
+            Uri uri = url == null ? null : Uri.parse(url);
+            if (uri == null || isConfiguredOrigin(uri)) {
+                return false;
+            }
+            openExternally(uri);
+            return true;
+        }
+
         @Override
         public void onPageStarted(WebView view, String url, Bitmap favicon) {
             mainFrameError = false;
@@ -542,12 +562,20 @@ public class MainActivity extends AppCompatActivity {
                     handled = true;
                     w.stopLoading();
                     handleNavigation(uri);
-                    w.post(w::destroy);
+                    // View.post en un WebView sin adjuntar no se ejecuta en API 24+: se usa el hilo principal.
+                    new Handler(Looper.getMainLooper()).post(w::destroy);
                 }
 
                 @Override
                 public boolean shouldOverrideUrlLoading(WebView w, WebResourceRequest request) {
                     capture(w, request.getUrl());
+                    return true;
+                }
+
+                @SuppressWarnings("deprecation")
+                @Override
+                public boolean shouldOverrideUrlLoading(WebView w, String url) {
+                    capture(w, url == null ? null : Uri.parse(url));
                     return true;
                 }
 

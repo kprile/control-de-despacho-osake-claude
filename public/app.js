@@ -39,7 +39,8 @@
     clockOffset: 0,       // serverTime - Date.now()
     filters: { from: '', to: '', branch: '', driverId: '', costMonth: '' },
     tab: 'orders',
-    refreshing: false,
+    refreshing: null,     // promesa del refresco en curso
+    openGroups: new Set(), // grupos <details> abiertos en la lista de pedidos
     timer: null,
     costsFilledFor: null,
     metricsFilled: false,
@@ -101,8 +102,11 @@
     const [y, mo, d] = ymd.split('-').map(Number);
     const [h, mi] = hm.split(':').map(Number);
     const guess = Date.UTC(y, mo - 1, d, h, mi);
-    let ts = guess - tzOffsetMs(guess);
-    ts = guess - tzOffsetMs(ts);
+    const offA = tzOffsetMs(guess);
+    const offB = tzOffsetMs(guess - offA);
+    let ts = guess - offB;
+    // Hora inexistente por el cambio a horario de verano: se lleva hacia adelante (igual que el servidor).
+    if (ts + tzOffsetMs(ts) !== guess) ts = guess - Math.min(offA, offB);
     return new Date(ts).toISOString();
   }
   function promisedFromTime(hm) {
@@ -242,10 +246,18 @@
     return s ? `?${s}` : '';
   }
 
+  // Un refresco forzado (tras una acción o un escaneo) espera al que esté en curso y vuelve a pedir
+  // el estado; si no, la respuesta en curso (anterior a la acción) dejaría la pantalla desactualizada.
   async function refresh({ force = false } = {}) {
-    if (app.refreshing) return false;
+    if (app.refreshing && !force) return false;
+    while (app.refreshing) await app.refreshing;
     if (!force && isEditing()) return false;
-    app.refreshing = true;
+    const run = doRefresh();
+    app.refreshing = run;
+    try { return await run; } finally { if (app.refreshing === run) app.refreshing = null; }
+  }
+
+  async function doRefresh() {
     try {
       const data = await api(`/api/state${stateQuery()}`);
       if (!data || !data.user) throw new ApiError('Respuesta inesperada del servidor.', 500);
@@ -263,8 +275,6 @@
         show($('#btn-retry'), true);
       }
       return false;
-    } finally {
-      app.refreshing = false;
     }
   }
 
@@ -449,18 +459,25 @@
     const closed = dispatch.filter((o) => CLOSED_STATUSES.includes(o.status))
       .sort((a, b) => String(b.deliveredAt || b.createdAt).localeCompare(String(a.deliveredAt || a.createdAt)));
     if (closed.length) {
-      const det = el('details', { class: 'group group-closed' },
+      const det = groupDetails('closed',
         el('summary', { class: 'group-title' }, 'Cerrados últimas 24 h', el('span', { class: 'count', text: ` (${closed.length})` })));
       for (const o of closed) det.append(staffCard(o));
       box.append(det);
     }
     if (pickups.length) {
-      const det = el('details', { class: 'group group-pickup' },
+      const det = groupDetails('pickup',
         el('summary', { class: 'group-title' }, 'Retiro en local (no se despachan)', el('span', { class: 'count', text: ` (${pickups.length})` })));
       for (const o of pickups) det.append(staffCard(o));
       box.append(det);
     }
     if (!any && !closed.length) box.prepend(el('p', { class: 'muted', text: 'No hay pedidos activos.' }));
+  }
+
+  // <details> que conserva su estado abierto entre refrescos (la lista se reconstruye cada 15 s).
+  function groupDetails(key, summary) {
+    const det = el('details', { class: `group group-${key}`, open: app.openGroups.has(key) }, summary);
+    det.addEventListener('toggle', () => { if (det.open) app.openGroups.add(key); else app.openGroups.delete(key); });
+    return det;
   }
 
   function setOptions(select, options, keepValue = true) {
@@ -478,10 +495,11 @@
     for (const b of branches) dl.append(el('option', { value: b }));
     const mb = $('#m-branch');
     if (document.activeElement !== mb) setOptions(mb, branches.map((b) => [b, b]));
-    if (app.filters.branch) mb.value = app.filters.branch;
+    const filtersDirty = !!$('#form-metrics').dataset.dirty;
+    if (app.filters.branch && !filtersDirty) mb.value = app.filters.branch;
     const md = $('#m-driver');
     if (document.activeElement !== md) setOptions(md, (app.data.drivers || []).map((d) => [d.id, d.active ? d.name : `${d.name} (inactivo)`]));
-    if (app.filters.driverId) md.value = app.filters.driverId;
+    if (app.filters.driverId && !filtersDirty) md.value = app.filters.driverId;
   }
 
   // ---------- Métricas ----------

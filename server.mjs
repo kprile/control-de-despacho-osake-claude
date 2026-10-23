@@ -50,7 +50,9 @@ export function loadDotEnv(file = path.join(ROOT, '.env'), target = process.env)
 
 function buildConfig(env) {
   const origins = String(env.PUBLIC_ORIGIN || 'http://127.0.0.1:4317')
-    .split(',').map((s) => s.trim().replace(/\/+$/, '')).filter(Boolean);
+    .split(',').map((s) => s.trim().replace(/\/+$/, '')).filter(Boolean)
+    // Normaliza mayúsculas y puerto por defecto, como lo envía el navegador en Origin.
+    .map((s) => { try { const u = new URL(s); return u.origin === 'null' ? s : u.origin; } catch { return s; } });
   const days = Number(env.SESSION_DAYS);
   return {
     host: env.HOST || '127.0.0.1',
@@ -116,8 +118,12 @@ function parseExternalTime(value) {
   if (local) {
     const [, y, mo, d, h, mi, se] = local.map((x) => (x === undefined ? '0' : x));
     const wall = Date.UTC(+y, +mo - 1, +d, +h, +mi, +se);
-    let utc = wall - tzOffsetMs(wall);
-    utc = wall - tzOffsetMs(utc);
+    const offA = tzOffsetMs(wall);
+    const offB = tzOffsetMs(wall - offA);
+    let utc = wall - offB;
+    // Hora inexistente (salto de horario de verano, p. ej. 00:30 del primer domingo de septiembre):
+    // ningún desfase es estable; se usa el anterior al cambio, que la lleva hacia adelante (01:30).
+    if (utc + tzOffsetMs(utc) !== wall) utc = wall - Math.min(offA, offB);
     return Number.isFinite(utc) ? utc : null;
   }
   const ms = Date.parse(s);
@@ -516,16 +522,19 @@ export function createApp({ dbPath, env = process.env, publicDir = path.join(ROO
 
   // ----- sesiones -----
   const tokenHash = (t) => crypto.createHash('sha256').update(t).digest('hex');
-  function cookieHeader(value, maxAge) {
-    return `sid=${value}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAge}${config.secureCookie ? '; Secure' : ''}`;
+  // Secure según el origen (ya validado) desde el que llegó la solicitud: con varios PUBLIC_ORIGIN
+  // (p. ej. emulador http + producción https) la cookie emitida vía https siempre lleva Secure.
+  function cookieHeader(value, maxAge, req) {
+    const secure = req?.allowedOrigin ? req.allowedOrigin.startsWith('https://') : config.secureCookie;
+    return `sid=${value}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAge}${secure ? '; Secure' : ''}`;
   }
-  function createSession(userId) {
+  function createSession(userId, req) {
     const token = crypto.randomBytes(32).toString('base64url');
     const now = Date.now();
     q.deleteExpired.run(new Date(now).toISOString());
     q.insertSession.run(tokenHash(token), userId, new Date(now).toISOString(),
       new Date(now + config.sessionDays * 86400000).toISOString());
-    return cookieHeader(token, Math.round(config.sessionDays * 86400));
+    return cookieHeader(token, Math.round(config.sessionDays * 86400), req);
   }
   function currentSession(req) {
     const token = parseCookies(req.headers.cookie).sid;
@@ -550,6 +559,7 @@ export function createApp({ dbPath, env = process.env, publicDir = path.join(ROO
     if (!origin || origin === 'null' || !config.origins.includes(origin.replace(/\/+$/, ''))) {
       throw new HttpError(403, 'bad_origin', 'Origen de la solicitud no permitido.');
     }
+    req.allowedOrigin = origin.replace(/\/+$/, '');
   }
 
   // ----- pedidos -----
@@ -1012,8 +1022,14 @@ export function createApp({ dbPath, env = process.env, publicDir = path.join(ROO
       case 'POST /api/setup': {
         const body = await readBody(req);
         if (q.userCount.get().n > 0) throw forbidden('El sistema ya fue configurado.');
-        if (config.setupToken && (typeof body.setupToken !== 'string' || !safeEqual(body.setupToken, config.setupToken))) {
-          throw forbidden('Código de instalación inválido.');
+        if (config.setupToken) {
+          // Sin límite, el código de alta podría probarse por fuerza bruta (no hay scrypt antes de compararlo).
+          const key = `${req.socket.remoteAddress || ''}|\u0000setup`;
+          checkRate(key);
+          if (typeof body.setupToken !== 'string' || !safeEqual(body.setupToken, config.setupToken)) {
+            registerFail(key);
+            throw forbidden('Código de instalación inválido.');
+          }
         }
         const name = reqText(body.name, 80, 'Nombre');
         const username = validateUsername(body.username);
@@ -1022,7 +1038,7 @@ export function createApp({ dbPath, env = process.env, publicDir = path.join(ROO
           if (q.userCount.get().n > 0) throw forbidden('El sistema ya fue configurado.');
           return q.insertUser.get(name, username, 'admin', salt, hash, nowIso()).id;
         });
-        return send(res, 200, { user: publicUser(q.userById.get(id)) }, { 'Set-Cookie': createSession(id) });
+        return send(res, 200, { user: publicUser(q.userById.get(id)) }, { 'Set-Cookie': createSession(id, req) });
       }
 
       case 'POST /api/login': {
@@ -1038,13 +1054,13 @@ export function createApp({ dbPath, env = process.env, publicDir = path.join(ROO
           throw new HttpError(401, 'unauthorized', 'Usuario o contraseña incorrectos.');
         }
         loginAttempts.delete(key);
-        return send(res, 200, { user: publicUser(user) }, { 'Set-Cookie': createSession(user.id) });
+        return send(res, 200, { user: publicUser(user) }, { 'Set-Cookie': createSession(user.id, req) });
       }
 
       case 'POST /api/logout': {
         const token = parseCookies(req.headers.cookie).sid;
         if (token) q.deleteSession.run(tokenHash(token));
-        return send(res, 200, { ok: true }, { 'Set-Cookie': cookieHeader('', 0) });
+        return send(res, 200, { ok: true }, { 'Set-Cookie': cookieHeader('', 0, req) });
       }
 
       case 'GET /api/state': {
