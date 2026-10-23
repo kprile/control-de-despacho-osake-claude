@@ -1,0 +1,50 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'cl.osake.despachos'
+    compileSdk 36
+
+    defaultConfig {
+        applicationId 'cl.osake.despachos'
+        minSdk 23
+        targetSdk 36
+        versionCode 1
+        versionName '0.1.0'
+    }
+
+    buildTypes {
+        debug {
+            // Solo afecta a Android 6 (API 23), que ignora networkSecurityConfig.
+            // En API 24+ manda network_security_config.xml (debug: cleartext solo a 10.0.2.2).
+            manifestPlaceholders = [usesCleartextTraffic: 'true']
+        }
+        release {
+            minifyEnabled false
+            manifestPlaceholders = [usesCleartextTraffic: 'false']
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    buildFeatures {
+        buildConfig true
+    }
+
+    lint {
+        abortOnError true
+        checkReleaseBuilds true
+        htmlReport true
+        xmlReport true
+    }
+}
+
+dependencies {
+    implementation 'androidx.activity:activity:1.10.1'
+    implementation 'androidx.appcompat:appcompat:1.7.1'
+    implementation 'com.google.android.gms:play-services-code-scanner:16.1.0'
+}

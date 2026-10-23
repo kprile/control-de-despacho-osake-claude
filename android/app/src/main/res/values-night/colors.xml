@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="brand">#0F172A</color>
+    <color name="accent">#FB7185</color>
+    <color name="error">#F87171</color>
+</resources>

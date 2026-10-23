@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Despachos Osake</string>
+
+    <string name="menu_scan">Escanear QR</string>
+    <string name="menu_refresh">Actualizar</string>
+    <string name="menu_settings">Configurar servidor</string>
+
+    <string name="settings_title">Servidor</string>
+    <string name="settings_message">Dirección del servidor de despachos (debe empezar con https://).</string>
+    <string name="settings_message_debug">Dirección del servidor (https://, o http://10.0.2.2:4317 en el emulador).</string>
+    <string name="settings_hint">https://despachos.ejemplo.cl</string>
+    <string name="settings_save">Guardar</string>
+    <string name="settings_cancel">Cancelar</string>
+
+    <string name="url_error_empty">Escribe la dirección del servidor.</string>
+    <string name="url_error_invalid">La dirección no es válida.</string>
+    <string name="url_error_https">La dirección debe empezar con https://.</string>
+    <string name="url_error_https_debug">Usa https://, o http://10.0.2.2:&lt;puerto&gt; en el emulador.</string>
+
+    <string name="error_title">No se pudo cargar la página</string>
+    <string name="error_generic">Revisa la conexión a internet o la dirección del servidor.</string>
+    <string name="error_ssl">El certificado del servidor no es válido. Por seguridad no se abrirá la página.</string>
+    <string name="error_detail">Detalle: %1$s</string>
+    <string name="no_server_title">Falta configurar el servidor</string>
+    <string name="no_server_message">Indica la dirección del servidor de despachos para empezar.</string>
+    <string name="action_retry">Reintentar</string>
+
+    <string name="scan_no_play_services">Este equipo no tiene Google Play Services disponible o actualizado; no se puede usar el lector QR.</string>
+    <string name="scan_module_downloading">El lector QR se está descargando. Intenta de nuevo en unos segundos.</string>
+    <string name="scan_failed">No se pudo abrir el lector QR. Revisa que Google Play Services esté actualizado.</string>
+    <string name="scan_not_allowed">El lector QR solo funciona en la página del servidor configurado.</string>
+    <string name="no_app_for_link">No hay una aplicación para abrir este enlace.</string>
+    <string name="download_started">Descargando %1$s…</string>
+    <string name="download_failed">No se pudo iniciar la descarga.</string>
+    <string name="link_blocked">Este tipo de enlace no está permitido.</string>
+</resources>

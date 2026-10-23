@@ -1,0 +1,13 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Caja de despacho con marca de verificación -->
+    <path
+        android:fillColor="@color/ic_launcher_foreground"
+        android:pathData="M34,40L54,30L74,40L74,66L54,76L34,66Z" />
+    <path
+        android:fillColor="@color/ic_launcher_background"
+        android:pathData="M44,53L48,49L52,53L61,44L65,48L52,61Z" />
+</vector>

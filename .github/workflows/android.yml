@@ -1,0 +1,52 @@
+name: Android
+
+on:
+  push:
+    paths:
+      - 'android/**'
+      - '.github/workflows/android.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Compilar APK debug y lint
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon :app:assembleDebug :app:lintDebug
+
+      - name: Subir APK debug
+        uses: actions/upload-artifact@v4
+        with:
+          name: despachos-android-debug
+          path: android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Subir informe lint
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: informe-android
+          path: android/app/build/reports/lint-results-debug.*
+          if-no-files-found: warn
+          retention-days: 14
