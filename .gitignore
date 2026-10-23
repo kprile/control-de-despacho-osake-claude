@@ -12,3 +12,7 @@ android/app/build/
 android/local.properties
 *.jks
 *.keystore
+
+# Credenciales de Google (cuenta de servicio)
+*service-account*.json
+credenciales/

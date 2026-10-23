@@ -317,7 +317,7 @@
       renderOrders();
       renderBranchesAndDrivers();
       renderMetrics();
-      if (isAdmin()) { renderCosts(); renderUsers(); }
+      if (isAdmin()) { renderCosts(); renderSheets(); renderUsers(); }
     }
   }
 
@@ -653,6 +653,39 @@
       await refresh({ force: true });
     } catch (err) {
       if (err.status !== 401) errBox.textContent = err.message;
+    }
+  });
+
+  // ---------- Google Sheets (copia de solo lectura) ----------
+  function renderSheets() {
+    const sh = app.data.sheets;
+    const statusEl = $('#sheets-status');
+    const errEl = $('#sheets-error');
+    const btn = $('#btn-sheets-sync');
+    if (!sh || !sh.enabled) {
+      statusEl.textContent = 'Deshabilitada: falta configurar GOOGLE_SHEETS_ID y GOOGLE_SERVICE_ACCOUNT_FILE en el servidor.';
+      errEl.textContent = '';
+      show(btn, false);
+      return;
+    }
+    show(btn, true);
+    const last = sh.lastSyncAt ? `Última copia: ${ddhhmm(sh.lastSyncAt)}.` : 'Aún no se ha hecho ninguna copia.';
+    statusEl.textContent = `${last} ${sh.pendingChanges ? 'Hay cambios pendientes de copiar.' : 'Sin cambios pendientes.'}`;
+    errEl.textContent = sh.lastError ? `Error en la última copia: ${sh.lastError}` : '';
+  }
+  $('#btn-sheets-sync').addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    try {
+      const res = await api('/api/sheets/sync', { method: 'POST' });
+      if (app.data) app.data.sheets = res.sheets;
+      renderSheets();
+      if (res.sheets.lastError) notify('No se pudo copiar a Google Sheets.', 'error');
+      else notify('Copia a Google Sheets actualizada.', 'success');
+    } catch (err) {
+      if (err.status !== 401) notify(err.message, 'error');
+    } finally {
+      btn.disabled = false;
     }
   });
 

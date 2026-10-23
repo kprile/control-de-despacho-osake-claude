@@ -10,7 +10,7 @@
   },
   "scripts": {
     "start": "node server.mjs",
-    "test": "node --test test.mjs"
+    "test": "node --test test.mjs test-sheets.mjs"
   },
   "dependencies": {
     "qrcode": "^1.5.4"

@@ -21,6 +21,11 @@ Documento fuente de verdad entre backend, web y Android. Si algo cambia, se camb
 | `MERCAT_WEBHOOK_SECRET` | vacío | Sin él, el webhook responde 503 `not_configured`. |
 | `DB_PATH` | `data/despachos.sqlite` | Ruta de la base (los tests usan una temporal). |
 | `SESSION_DAYS` | `14` | Duración de sesión. |
+| `GOOGLE_SHEETS_ID` | vacío | ID de la hoja de Google para la copia de solo lectura. Ver "Copia a Google Sheets". |
+| `GOOGLE_SERVICE_ACCOUNT_FILE` | vacío | Ruta al JSON de la clave de la cuenta de servicio (fuera del repo). |
+| `GOOGLE_SHEETS_INTERVAL_SECONDS` | `60` | Segundos mínimos entre copias. |
+| `GOOGLE_SHEETS_DAYS` | `90` | Días de pedidos copiados. |
+| `GOOGLE_API_BASE`, `GOOGLE_TOKEN_URL` | Google | Solo para pruebas (servidor falso). |
 
 El servidor carga `.env` si existe (parser propio mínimo `CLAVE=valor`).
 
@@ -101,6 +106,7 @@ Los motoristas no reciben `total` ni datos de otros pedidos.
 | `GET /api/qr?id=<orderId>` | sesión con acceso al pedido | — | `image/svg+xml` etiqueta con QR + id + dirección |
 | `GET /api/export.csv` | admin | mismos filtros que métricas | CSV con un pedido por fila y los 4 tiempos |
 | `POST /api/webhooks/mercat` | encabezado `X-Webhook-Secret` | evento Mercat | `200 { ok: true, applied: bool, duplicate: bool }` |
+| `POST /api/sheets/sync` | admin | — | `{ sheets: SheetsStatus }`; 503 `not_configured` si la copia está deshabilitada |
 
 ### `GET /api/state`
 
@@ -113,7 +119,8 @@ Los motoristas no reciben `total` ni datos de otros pedidos.
   "users": [User],            // solo admin
   "branches": ["Melipilla"],  // distintas sucursales vistas
   "metrics": Metrics,         // admin y local
-  "costs": Costs | null       // solo admin
+  "costs": Costs | null,      // solo admin
+  "sheets": SheetsStatus      // solo admin
 }
 ```
 
@@ -147,6 +154,28 @@ Solo se promedian intervalos con ambos extremos presentes y fin >= inicio; `coun
 }
 ```
 Se guarda un registro de costos **por mes** (tabla `monthly_costs`, PK `month`), así queda historial. `GET /api/state?costMonth=YYYY-MM` elige el mes (defecto mes actual Chile).
+
+## Copia a Google Sheets
+
+Decisión del usuario: **SQLite es la fuente de verdad**. Google Sheets es solo una copia automática de **solo lectura** para el negocio, alimentada por el servidor (`sheets.mjs`). La app nunca lee la hoja; lo que se edite allá se pierde en la siguiente copia.
+
+- Habilitada solo si están `GOOGLE_SHEETS_ID` y `GOOGLE_SERVICE_ACCOUNT_FILE`. Si falta alguno: deshabilitada, sin errores.
+- Autenticación con cuenta de servicio sin dependencias: JWT RS256 firmado con `node:crypto` (scope `https://www.googleapis.com/auth/spreadsheets`), canjeado en `https://oauth2.googleapis.com/token`; el token se reutiliza hasta 1 min antes de vencer. Nunca se registran la clave ni el token.
+- Cada cambio de pedido (todo lo que escribe en `order_events`: acciones, pedidos manuales, webhook) y cada `POST /api/settings` marca la copia como pendiente. Un temporizador en segundo plano (`unref`) reescribe la hoja cuando hay cambios pendientes y pasó `GOOGLE_SHEETS_INTERVAL_SECONDS`. Una sola copia a la vez; ante error, reintento con espera creciente (hasta 30 min) y timeout de red de 15 s por llamada. Nunca bloquea ni hace fallar una petición de usuario ni el webhook.
+- Reescritura completa e idempotente: `spreadsheets.get` (crea con `batchUpdate addSheet` las pestañas que falten), `values:batchClear` y `values:batchUpdate` con `valueInputOption: RAW`.
+- Pestaña `Pedidos`: encabezado + un pedido por fila, creados en los últimos `GOOGLE_SHEETS_DAYS` días (hora Chile), **sin retiros (pickup)**. Columnas: id, origen, canal, sucursal, cliente, dirección, motorista, estado, estado externo, tarifa (CLP), monto pedido (CLP), creado, listo, salida, entregado (`YYYY-MM-DD HH:mm` hora Chile), min hasta listo, min espera retiro, min reparto, min total, incidencias y, si existen en la base, las columnas de distancia de entrega (`orders.*distan*`). No incluye el teléfono del cliente.
+- Pestaña `Resumen`: métricas de los últimos 7 y 30 días (mismo cálculo que `Metrics`, con cantidad de pedidos que sustentan cada promedio) y costos del mes actual (`Costs`).
+- Todo texto que empiece con `=`, `+`, `-` o `@` se antepone con `'`.
+
+`SheetsStatus` (en `GET /api/state` solo admin, y respuesta de `POST /api/sheets/sync`):
+
+```json
+{ "enabled": true, "lastSyncAt": "ISO" | null, "lastError": "texto sin datos sensibles" | null, "pendingChanges": false }
+```
+
+`POST /api/sheets/sync` (admin, con validación de Origin) fuerza una copia ignorando intervalo y espera de reintento; espera hasta 20 s y responde el estado (si tarda más, la copia sigue en segundo plano).
+
+Pasos de configuración: ver README. **No se ha probado contra Google real**; las pruebas usan un servidor falso local.
 
 ## Webhook Mercat
 

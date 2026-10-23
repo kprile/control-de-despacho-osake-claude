@@ -20,8 +20,9 @@ Objetivo: trazabilidad de cada pedido y datos reales de demoras y costo; no solo
 | Contraseña | Mínimo 6 caracteres (no longitud exacta). |
 | Compilación | En GitHub Actions. |
 | Repositorio | Todo el trabajo vive en `kprile/control-de-despacho-osake-claude`. |
+| Google Sheets | Solo como copia automática de solo lectura para el negocio, alimentada por el servidor. SQLite sigue siendo la fuente de verdad y la app nunca lee la hoja. |
 
-No hay decisión de usar Google Sheets, Supabase, Cloudflare, Zapier ni Google Maps de pago, ni de publicar en Google Play.
+No hay decisión de usar Supabase, Cloudflare, Zapier ni Google Maps de pago, ni de publicar en Google Play.
 
 ## Qué NO está confirmado
 

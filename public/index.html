@@ -239,6 +239,13 @@
           <button type="submit" class="btn btn-primary btn-block">Guardar costos del mes</button>
         </form>
         <div id="costs-view"></div>
+        <section class="card form-card form-wide" id="sheets-card" aria-labelledby="sheets-title">
+          <h2 id="sheets-title">Google Sheets</h2>
+          <p id="sheets-status" class="muted" role="status">—</p>
+          <p class="form-error" id="sheets-error" role="alert"></p>
+          <button type="button" class="btn" id="btn-sheets-sync">Sincronizar ahora</button>
+          <p class="note">Copia automática de solo lectura para el negocio. La app no lee la hoja: lo que se edite allá se pierde en la siguiente copia.</p>
+        </section>
       </div>
 
       <!-- Usuarios -->

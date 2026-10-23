@@ -6,6 +6,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import QRCode from 'qrcode';
+import { createSheetsSync } from './sheets.mjs';
 
 // node:sqlite emite un ExperimentalWarning en Node 22; lo silenciamos solo a él.
 const originalEmitWarning = process.emitWarning;
@@ -503,6 +504,8 @@ export function createApp({ dbPath, env = process.env, publicDir = path.join(ROO
   const config = buildConfig(env);
   const db = openDb(dbPath || config.dbPath);
   const loginAttempts = new Map();
+  // Copia de solo lectura a Google Sheets; se marca "sucia" en logEvent (todo cambio de pedido) y al guardar costos.
+  const sheets = createSheetsSync({ env, getSnapshot: (days) => sheetsSnapshot(days) });
 
   const q = {
     userCount: db.prepare('SELECT COUNT(*) AS n FROM users'),
@@ -615,6 +618,7 @@ export function createApp({ dbPath, env = process.env, publicDir = path.join(ROO
     db.prepare(`UPDATE orders SET ${cols.map((c) => `${c} = ?`).join(', ')} WHERE id = ?`).run(...cols.map((c) => fields[c]), id);
   }
   function logEvent(orderId, user, action, from, to, note = null, data = null) {
+    sheets.markDirty();
     q.insertEvent.run(orderId, nowIso(), user?.id ?? null, user?.name ?? 'Mercat', action, from, to, note,
       data ? JSON.stringify(data) : null);
   }
@@ -956,8 +960,29 @@ export function createApp({ dbPath, env = process.env, publicDir = path.join(ROO
       const costMonth = params.get('costMonth') || todayChile().slice(0, 7);
       if (!isValidMonth(costMonth)) throw bad('Mes inválido (YYYY-MM).');
       state.costs = computeCosts(costMonth);
+      const { enabled, lastSyncAt, lastError, pendingChanges } = sheets.status();
+      state.sheets = { enabled, lastSyncAt, lastError, pendingChanges };
     }
     return state;
+  }
+
+  function sheetsSnapshot(days) {
+    const to = todayChile();
+    const all = { branch: '', driverId: null };
+    const rows = ordersInRange({ from: addDays(to, -(days - 1)), to, ...all });
+    const inc = new Map();
+    for (let i = 0; i < rows.length; i += 500) {
+      for (const [k, v] of incidentsFor(rows.slice(i, i + 500).map((r) => r.id))) inc.set(k, v);
+    }
+    const distanceColumns = db.prepare('PRAGMA table_info(orders)').all().map((c) => c.name).filter((n) => /distan/i.test(n));
+    return {
+      generatedAt: nowIso(),
+      orders: rows.map((o) => ({ ...o, minutes: intervals(o), incidents: inc.get(o.id) || [] })),
+      distanceColumns,
+      metrics7: computeMetrics({ from: addDays(to, -6), to, ...all }),
+      metrics30: computeMetrics({ from: addDays(to, -29), to, ...all }),
+      costs: computeCosts(to.slice(0, 7)),
+    };
   }
 
   function buildCsv(filters) {
@@ -1132,7 +1157,18 @@ export function createApp({ dbPath, env = process.env, publicDir = path.join(ROO
           ON CONFLICT(month) DO UPDATE SET labor = excluded.labor, fuel = excluded.fuel, maintenance = excluded.maintenance,
             insurance = excluded.insurance, other = excluded.other, updated_at = excluded.updated_at, updated_by = excluded.updated_by`)
           .run(body.month, v.labor, v.fuel, v.maintenance, v.insurance, v.other, nowIso(), user.id);
+        sheets.markDirty();
         return send(res, 200, { costs: computeCosts(body.month) });
+      }
+
+      case 'POST /api/sheets/sync': {
+        requireUser(req, ['admin']);
+        if (!sheets.enabled) throw new HttpError(503, 'not_configured', 'La copia a Google Sheets no está configurada.');
+        // Espera la copia hasta 20 s; si tarda más, responde el estado actual y la copia sigue en segundo plano.
+        const pending = sheets.syncNow();
+        const st = await Promise.race([pending, new Promise((r) => setTimeout(r, 20000).unref())]);
+        const { enabled, lastSyncAt, lastError, pendingChanges } = st || sheets.status();
+        return send(res, 200, { sheets: { enabled, lastSyncAt, lastError, pendingChanges } });
       }
 
       case 'GET /api/qr': {
@@ -1156,7 +1192,7 @@ export function createApp({ dbPath, env = process.env, publicDir = path.join(ROO
       }
     }
     const known = ['/api/status', '/api/setup', '/api/login', '/api/logout', '/api/state', '/api/users', '/api/users/update',
-      '/api/orders', '/api/action', '/api/settings', '/api/qr', '/api/export.csv', '/api/webhooks/mercat'];
+      '/api/orders', '/api/action', '/api/settings', '/api/qr', '/api/export.csv', '/api/webhooks/mercat', '/api/sheets/sync'];
     if (known.includes(url.pathname)) throw new HttpError(405, 'method_not_allowed', 'Método no permitido.');
     throw notFound('Ruta no encontrada.');
   }
@@ -1216,6 +1252,7 @@ export function createApp({ dbPath, env = process.env, publicDir = path.join(ROO
   async function close() {
     if (closed) return;
     closed = true;
+    await sheets.stop();
     await new Promise((resolve) => {
       if (!server.listening) return resolve();
       server.close(() => resolve());
@@ -1224,7 +1261,9 @@ export function createApp({ dbPath, env = process.env, publicDir = path.join(ROO
     db.close();
   }
 
-  return { server, db, config, close };
+  sheets.start();
+
+  return { server, db, config, sheets, close };
 }
 
 // Arranque directo: node server.mjs
@@ -1240,6 +1279,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
     console.log(`Despachos Osake escuchando en http://${host}:${port}`);
     console.log(`Orígenes permitidos: ${origins.join(', ')}`);
     if (!app.config.webhookSecret) console.log('Aviso: MERCAT_WEBHOOK_SECRET no definido; el webhook responderá 503.');
+    console.log(app.sheets.enabled ? 'Copia a Google Sheets activada.' : 'Copia a Google Sheets desactivada (sin GOOGLE_SHEETS_ID o GOOGLE_SERVICE_ACCOUNT_FILE).');
   });
   const stop = () => { app.close().finally(() => process.exit(0)); };
   process.on('SIGINT', stop);
