@@ -313,7 +313,8 @@ test('Google inalcanzable o archivo de clave ausente: error controlado', async (
 test('la copia corre sola en segundo plano cuando hay cambios', async () => {
   const { app: a } = await start({ ...sheetsEnv(), GOOGLE_SHEETS_INTERVAL_SECONDS: '1' });
   const t0 = Date.now();
-  while (!a.sheets.status().lastSyncAt && Date.now() - t0 < 5000) await new Promise((r) => setTimeout(r, 100));
+  // Margen amplio: con la máquina cargada el temporizador puede atrasarse varios segundos.
+  while (!a.sheets.status().lastSyncAt && Date.now() - t0 < 20000) await new Promise((r) => setTimeout(r, 100));
   const st = a.sheets.status();
   assert.ok(st.lastSyncAt, 'hizo la copia automática');
   assert.equal(st.pendingChanges, false);
