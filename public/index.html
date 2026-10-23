@@ -1,0 +1,311 @@
+<!doctype html>
+<html lang="es-CL">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>Despachos Osake</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Saltar al contenido</a>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-name">Osake</span>
+      <span class="brand-sub">Despachos</span>
+    </div>
+    <div class="topbar-user" id="topbar-user" hidden>
+      <span id="user-label" class="user-label"></span>
+    </div>
+    <div class="topbar-actions">
+      <button type="button" class="btn btn-small btn-ghost" id="btn-server" hidden>Servidor</button>
+      <button type="button" class="btn btn-small btn-ghost" id="btn-refresh" hidden>Actualizar</button>
+      <button type="button" class="btn btn-small btn-ghost" id="btn-logout" hidden>Salir</button>
+    </div>
+  </header>
+
+  <div id="offline" class="banner banner-offline" role="alert" hidden>
+    Sin conexión con el servidor. Las acciones requieren conexión; se reintentará automáticamente.
+  </div>
+
+  <div class="toasts">
+    <div id="toast-status" class="toast-region" role="status" aria-live="polite"></div>
+    <div id="toast-alert" class="toast-region" role="alert" aria-live="assertive"></div>
+  </div>
+
+  <main id="main" tabindex="-1">
+    <!-- Cargando -->
+    <section id="view-loading" class="view view-center">
+      <p class="muted" id="loading-text">Cargando…</p>
+      <button type="button" class="btn" id="btn-retry" hidden>Reintentar</button>
+    </section>
+
+    <!-- Alta inicial -->
+    <section id="view-setup" class="view view-center" hidden aria-labelledby="setup-title">
+      <form id="form-setup" class="card form-card" novalidate>
+        <h1 id="setup-title">Alta inicial</h1>
+        <p class="muted">No hay usuarios todavía. Crea la cuenta de administración.</p>
+        <div class="field">
+          <label for="setup-name">Nombre</label>
+          <input id="setup-name" name="name" required autocomplete="name">
+        </div>
+        <div class="field">
+          <label for="setup-username">Usuario</label>
+          <input id="setup-username" name="username" required autocomplete="username" autocapitalize="none" spellcheck="false">
+        </div>
+        <div class="field">
+          <label for="setup-password">Contraseña</label>
+          <input id="setup-password" name="password" type="password" required minlength="6" autocomplete="new-password" aria-describedby="setup-password-help">
+          <small id="setup-password-help" class="help">Mínimo 6 caracteres.</small>
+        </div>
+        <div class="field" id="setup-token-field" hidden>
+          <label for="setup-token">Código de alta (setupToken)</label>
+          <input id="setup-token" name="setupToken" autocomplete="off" autocapitalize="none" spellcheck="false" aria-describedby="setup-token-help">
+          <small id="setup-token-help" class="help">Lo entrega quien instaló el servidor.</small>
+        </div>
+        <p class="form-error" id="setup-error" role="alert"></p>
+        <button type="submit" class="btn btn-primary btn-block">Crear administrador</button>
+      </form>
+    </section>
+
+    <!-- Login -->
+    <section id="view-login" class="view view-center" hidden aria-labelledby="login-title">
+      <form id="form-login" class="card form-card" novalidate>
+        <h1 id="login-title">Ingresar</h1>
+        <div class="field">
+          <label for="login-username">Usuario</label>
+          <input id="login-username" name="username" required autocomplete="username" autocapitalize="none" spellcheck="false">
+        </div>
+        <div class="field">
+          <label for="login-password">Contraseña</label>
+          <input id="login-password" name="password" type="password" required minlength="6" autocomplete="current-password" aria-describedby="login-password-help">
+          <small id="login-password-help" class="help">Mínimo 6 caracteres.</small>
+        </div>
+        <p class="form-error" id="login-error" role="alert"></p>
+        <button type="submit" class="btn btn-primary btn-block">Ingresar</button>
+      </form>
+    </section>
+
+    <!-- Panel admin / local -->
+    <section id="view-admin" class="view" hidden aria-label="Panel del local">
+      <nav class="tabs" aria-label="Secciones">
+        <button type="button" class="tab" data-tab="orders">Pedidos</button>
+        <button type="button" class="tab" data-tab="new">Nuevo pedido</button>
+        <button type="button" class="tab" data-tab="metrics">Métricas</button>
+        <button type="button" class="tab" data-tab="costs" data-admin-only>Costos</button>
+        <button type="button" class="tab" data-tab="users" data-admin-only>Usuarios</button>
+      </nav>
+
+      <!-- Pedidos -->
+      <div class="tab-panel" id="tab-orders" data-panel="orders" hidden>
+        <form class="card scanner" id="form-scan-admin" novalidate>
+          <label for="scan-input-admin">Lector de código</label>
+          <div class="input-row">
+            <input id="scan-input-admin" name="code" placeholder="DESPACHO:P-1001 o P-1001" autocomplete="off" autocapitalize="none" spellcheck="false" aria-describedby="scan-help-admin">
+            <button type="submit" class="btn btn-primary">Buscar</button>
+            <button type="button" class="btn" data-android-scan hidden>Escanear QR</button>
+          </div>
+          <small id="scan-help-admin" class="help">Escribe, pega o lee con la pistola el código de la etiqueta.</small>
+        </form>
+        <div id="orders-list" class="orders-list" aria-live="off"></div>
+      </div>
+
+      <!-- Nuevo pedido -->
+      <div class="tab-panel" id="tab-new" data-panel="new" hidden>
+        <form id="form-order" class="card form-card form-wide" novalidate>
+          <h2>Nuevo pedido manual</h2>
+          <div class="grid-2">
+            <div class="field">
+              <label for="order-channel">Canal</label>
+              <select id="order-channel" name="channel">
+                <option value="meson">Mesón</option>
+                <option value="telefono">Teléfono</option>
+                <option value="otro">Otro</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="order-branch">Sucursal</label>
+              <input id="order-branch" name="branch" list="branches-list" value="Melipilla" autocomplete="off">
+              <datalist id="branches-list"></datalist>
+            </div>
+            <div class="field">
+              <label for="order-customer">Cliente</label>
+              <input id="order-customer" name="customerName" autocomplete="off">
+            </div>
+            <div class="field">
+              <label for="order-phone">Teléfono</label>
+              <input id="order-phone" name="customerPhone" type="tel" inputmode="tel" autocomplete="off" placeholder="+56 9 1234 5678">
+            </div>
+            <div class="field span-2">
+              <label for="order-address">Dirección <span class="req" aria-hidden="true">*</span></label>
+              <input id="order-address" name="address" required autocomplete="off" aria-describedby="order-address-help">
+              <small id="order-address-help" class="help">Obligatoria.</small>
+            </div>
+            <div class="field">
+              <label for="order-detail">Depto / referencia</label>
+              <input id="order-detail" name="addressDetail" autocomplete="off">
+            </div>
+            <div class="field">
+              <label for="order-promised">Hora prometida (opcional)</label>
+              <input id="order-promised" name="promisedAt" type="time">
+            </div>
+            <div class="field">
+              <label for="order-fee">Tarifa delivery (CLP)</label>
+              <input id="order-fee" name="deliveryFee" type="number" inputmode="numeric" min="0" step="1">
+            </div>
+            <div class="field">
+              <label for="order-total">Total (CLP)</label>
+              <input id="order-total" name="total" type="number" inputmode="numeric" min="0" step="1">
+            </div>
+            <div class="field span-2">
+              <label for="order-notes">Notas</label>
+              <textarea id="order-notes" name="notes" rows="2"></textarea>
+            </div>
+          </div>
+          <fieldset class="items">
+            <legend>Productos</legend>
+            <div id="items-rows"></div>
+            <button type="button" class="btn btn-small" id="btn-add-item">Agregar producto</button>
+          </fieldset>
+          <p class="form-error" id="order-error" role="alert"></p>
+          <button type="submit" class="btn btn-primary btn-block">Crear pedido</button>
+        </form>
+      </div>
+
+      <!-- Métricas -->
+      <div class="tab-panel" id="tab-metrics" data-panel="metrics" hidden>
+        <form id="form-metrics" class="card filters" novalidate>
+          <h2>Métricas</h2>
+          <div class="grid-4">
+            <div class="field">
+              <label for="m-from">Desde</label>
+              <input id="m-from" name="from" type="date">
+            </div>
+            <div class="field">
+              <label for="m-to">Hasta</label>
+              <input id="m-to" name="to" type="date">
+            </div>
+            <div class="field">
+              <label for="m-branch">Sucursal</label>
+              <select id="m-branch" name="branch"><option value="">Todas</option></select>
+            </div>
+            <div class="field">
+              <label for="m-driver">Motorista</label>
+              <select id="m-driver" name="driverId"><option value="">Todos</option></select>
+            </div>
+          </div>
+          <div class="btn-row">
+            <button type="submit" class="btn btn-primary">Aplicar filtros</button>
+            <button type="button" class="btn" id="btn-metrics-reset">Últimos 7 días</button>
+            <a class="btn" id="link-export" href="/api/export.csv" data-admin-only download>Exportar CSV</a>
+          </div>
+        </form>
+        <div id="metrics-view"></div>
+      </div>
+
+      <!-- Costos -->
+      <div class="tab-panel" id="tab-costs" data-panel="costs" hidden>
+        <form id="form-costs" class="card form-card form-wide" novalidate>
+          <h2>Costos del mes</h2>
+          <div class="field">
+            <label for="c-month">Mes</label>
+            <input id="c-month" name="month" type="month" required>
+          </div>
+          <div class="grid-2">
+            <div class="field">
+              <label for="c-labor">Personal (sueldos motoristas)</label>
+              <input id="c-labor" name="labor" type="number" inputmode="numeric" min="0" step="1" required>
+            </div>
+            <div class="field">
+              <label for="c-fuel">Combustible</label>
+              <input id="c-fuel" name="fuel" type="number" inputmode="numeric" min="0" step="1" required>
+            </div>
+            <div class="field">
+              <label for="c-maintenance">Mantención</label>
+              <input id="c-maintenance" name="maintenance" type="number" inputmode="numeric" min="0" step="1" required>
+            </div>
+            <div class="field">
+              <label for="c-insurance">Seguros</label>
+              <input id="c-insurance" name="insurance" type="number" inputmode="numeric" min="0" step="1" required>
+            </div>
+            <div class="field">
+              <label for="c-other">Otros</label>
+              <input id="c-other" name="other" type="number" inputmode="numeric" min="0" step="1" required>
+            </div>
+          </div>
+          <p class="form-error" id="costs-error" role="alert"></p>
+          <button type="submit" class="btn btn-primary btn-block">Guardar costos del mes</button>
+        </form>
+        <div id="costs-view"></div>
+      </div>
+
+      <!-- Usuarios -->
+      <div class="tab-panel" id="tab-users" data-panel="users" hidden>
+        <form id="form-user" class="card form-card form-wide" novalidate>
+          <h2>Crear usuario</h2>
+          <div class="grid-2">
+            <div class="field">
+              <label for="u-name">Nombre</label>
+              <input id="u-name" name="name" required autocomplete="off">
+            </div>
+            <div class="field">
+              <label for="u-username">Usuario</label>
+              <input id="u-username" name="username" required autocomplete="off" autocapitalize="none" spellcheck="false">
+            </div>
+            <div class="field">
+              <label for="u-password">Contraseña</label>
+              <input id="u-password" name="password" type="password" required minlength="6" autocomplete="new-password" aria-describedby="u-password-help">
+              <small id="u-password-help" class="help">Mínimo 6 caracteres.</small>
+            </div>
+            <div class="field">
+              <label for="u-role">Rol</label>
+              <select id="u-role" name="role">
+                <option value="driver">Motorista</option>
+                <option value="local">Local</option>
+                <option value="admin">Administración</option>
+              </select>
+            </div>
+          </div>
+          <p class="form-error" id="user-error" role="alert"></p>
+          <button type="submit" class="btn btn-primary btn-block">Crear usuario</button>
+        </form>
+        <div id="users-view"></div>
+      </div>
+    </section>
+
+    <!-- Panel motorista -->
+    <section id="view-driver" class="view" hidden aria-labelledby="driver-title">
+      <h1 id="driver-title" class="visually-hidden">Mis pedidos</h1>
+      <div class="driver-scan" id="driver-scan">
+        <button type="button" class="btn btn-primary btn-xl btn-block" data-android-scan hidden>Escanear QR</button>
+        <form id="form-scan-driver" class="scanner scanner-compact" novalidate>
+          <label for="scan-input-driver">Buscar por código</label>
+          <div class="input-row">
+            <input id="scan-input-driver" name="code" placeholder="DESPACHO:P-1001" autocomplete="off" autocapitalize="none" spellcheck="false">
+            <button type="submit" class="btn">Buscar</button>
+          </div>
+        </form>
+      </div>
+      <h2 class="section-title">Mis pedidos activos</h2>
+      <div id="driver-active" class="driver-list"></div>
+      <h2 class="section-title">Entregados hoy</h2>
+      <div id="driver-done"></div>
+    </section>
+  </main>
+
+  <!-- Diálogo genérico de confirmación -->
+  <dialog id="dlg" aria-labelledby="dlg-title">
+    <form id="dlg-form" novalidate>
+      <h2 id="dlg-title"></h2>
+      <div id="dlg-body" class="dlg-body"></div>
+      <p id="dlg-error" class="form-error" role="alert"></p>
+      <div class="dlg-actions">
+        <button type="button" class="btn" id="dlg-cancel">Cancelar</button>
+        <button type="submit" class="btn btn-primary" id="dlg-ok">Confirmar</button>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>
